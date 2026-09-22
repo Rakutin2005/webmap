@@ -1,0 +1,26 @@
+# Build artifacts
+/webmap
+/dist/
+
+# Analysis outputs (generated per-scan: graph files and web maps)
+*.wmap/
+*.wmap.tar.xz
+graph.html
+graph.md
+graph.mmd
+graph.mmd.svg
+
+# Debug scratch files
+debug.txt
+flag_debug.txt
+graph_debug.txt
+graph_err.txt
+stderr.txt
+stdout.txt
+
+# Local tool state
+opencode
+.claude/
+
+# Go
+*.test
