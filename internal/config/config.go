@@ -48,6 +48,8 @@ type Config struct {
 	APIContract     bool
 	APIContractRaw  bool
 	NoGroup         bool
+	NoStringGroup   bool
+	GroupStrings    bool
 	GroupCount      int
 }
 
@@ -56,6 +58,7 @@ func Parse() *Config {
 		RecursiveDepth: 5,
 		Threads:        32,
 		GroupCount:     2,
+		NoStringGroup:  true,
 	}
 
 	flag.StringVar(&c.URL, "url", "", "URL to parse (required)")
@@ -85,6 +88,7 @@ func Parse() *Config {
 	flag.BoolVar(&c.APIContract, "apic", false, "Show inferred API contracts (endpoint methods, headers, URL/bodies formats, sample bodies)")
 	flag.BoolVar(&c.APIContractRaw, "apic-raw", false, "Show request usage evidence (raw requests) in API contracts; tokens stay masked")
 	flag.BoolVar(&c.NoGroup, "nogroup", false, "Disable URL pattern grouping")
+	flag.BoolVar(&c.GroupStrings, "str", false, "Group by string literals too (off by default: only typed ids like int/uuid/hash/base64 fold into patterns)")
 	flag.IntVar(&c.GroupCount, "group-count", 2, "Minimum number of matching URLs before they are folded into a pattern (default: 2)")
 
 	followLong := flag.String("follow", "", "Comma-separated additional domains to include in the recursive crawl (subdomains included)")
@@ -156,6 +160,10 @@ func Parse() *Config {
 			}
 		}
 	})
+
+	if c.GroupStrings {
+		c.NoStringGroup = false
+	}
 
 	return c
 }

@@ -333,3 +333,49 @@ func TestUnresolvableIdentNotJunkLink(t *testing.T) {
 		`e.post('/api/user/archive/requests/' + userId)`,
 		"https://example.com", 1)
 }
+
+func TestResponseFieldInference(t *testing.T) {
+	src := `fetch('/api/city-poi?days=7').then(r => r.json()).then(data => {
+  console.log(data.items.length);
+  data.items.forEach(x => { console.log(x.price, x.address); });
+  console.log(data.meta.total, data.meta.generated_at);
+});
+axios.get('/api/complexes-map').then(res => {
+  res.data.features.map(f => f.geometry.coordinates);
+  res.data.count.toFixed(2);
+});`
+	_, obs := Parse(src, "https://x.test/app.js", true)
+	got := map[string]map[string]string{}
+	for _, o := range obs {
+		for _, f := range o.ResponseFields {
+			if got[o.URL] == nil {
+				got[o.URL] = map[string]string{}
+			}
+			got[o.URL][f.Path] = f.Kind
+		}
+	}
+	fields := got["https://x.test/api/city-poi?days=7"]
+	for path, kind := range map[string]string{
+		"items":           "array",
+		"items[].price":   "any",
+		"items[].address": "any",
+		"meta.total":      "any",
+	} {
+		if fields[path] != kind {
+			t.Errorf("city-poi %s = %q, want %q (all: %v)", path, fields[path], kind, fields)
+		}
+	}
+	if _, leaked := fields["json"]; leaked {
+		t.Errorf("payload method leaked into schema: %v", fields)
+	}
+	mapFields := got["https://x.test/api/complexes-map"]
+	if mapFields["data.features"] != "array" {
+		t.Errorf("complexes-map data.features = %q (all: %v)", mapFields["data.features"], mapFields)
+	}
+	if mapFields["data.features[].geometry.coordinates"] == "" {
+		t.Errorf("missing nested element field (all: %v)", mapFields)
+	}
+	if mapFields["data.count"] != "number" {
+		t.Errorf("complexes-map data.count = %q, want number", mapFields["data.count"])
+	}
+}

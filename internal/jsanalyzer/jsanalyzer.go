@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -39,7 +40,31 @@ func Parse(jsContent string, sourceURL string, fullInfo bool) (result []linker.L
 	// on tokens (not the AST) so it works even when parsing bails out on minified
 	// or exotic syntax.
 	ctx.harvestTokens(tokens)
+	ctx.attachResponseFields()
 	return ctx.links, ctx.obs
+}
+
+// attachResponseFields copies the statically inferred response schema onto the
+// observations of the endpoints it was collected for.
+func (c *context) attachResponseFields() {
+	if len(c.respField) == 0 {
+		return
+	}
+	for i := range c.obs {
+		set := c.respField[c.obs[i].URL]
+		if len(set) == 0 {
+			continue
+		}
+		paths := make([]string, 0, len(set))
+		for p := range set {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		c.obs[i].ResponseFields = make([]contract.ResponseField, 0, len(paths))
+		for _, p := range paths {
+			c.obs[i].ResponseFields = append(c.obs[i].ResponseFields, contract.ResponseField{Path: p, Kind: set[p]})
+		}
+	}
 }
 
 // harvestTokens scans every string and template-literal token for values that
@@ -259,6 +284,14 @@ type context struct {
 	seen      map[string]bool
 	obs       []contract.Observation
 	obsSeen   map[string]bool
+
+	// Response-shape inference: respVar maps a response callback parameter to
+	// the endpoint it belongs to, respElem maps an element callback parameter
+	// to its path prefix ("items[]"), and respField collects the field paths
+	// read off the response together with the kind inferred from the usage.
+	respVar   map[string]string
+	respElem  map[string]string
+	respField map[string]map[string]string
 }
 
 func newContext(sourceURL string, fullInfo bool) *context {
@@ -270,6 +303,9 @@ func newContext(sourceURL string, fullInfo bool) *context {
 		varInits:  map[string]expr{},
 		seen:      map[string]bool{},
 		obsSeen:   map[string]bool{},
+		respVar:   map[string]string{},
+		respElem:  map[string]string{},
+		respField: map[string]map[string]string{},
 	}
 }
 
@@ -748,6 +784,14 @@ var chainMethods = map[string]bool{
 func (c *context) analyzeCall(ce *callExpr) {
 	if me, ok := ce.callee.(*memberExpr); ok {
 		if chainMethods[me.property] {
+			// fetch(url).then(r => r.json()) / client.get(url).then(res => …):
+			// bind the callback parameter to the endpoint so the fields read
+			// off the response become that endpoint's response schema.
+			if responseChains[me.property] {
+				if endpoint := c.chainEndpoint(me.object); endpoint != "" {
+					c.bindResponse(ce.args, endpoint)
+				}
+			}
 			if innerCall, ok := me.object.(*callExpr); ok {
 				c.analyzeCall(innerCall)
 				return
@@ -767,6 +811,294 @@ func (c *context) analyzeCall(ce *callExpr) {
 		return
 	}
 	c.applyMatch(match, ce.args, objName, methodName, httpMethod)
+}
+
+// responseChains are the chain callbacks that receive the response payload.
+var responseChains = map[string]bool{
+	"then": true, "done": true, "end": true, "subscribe": true, "exec": true,
+}
+
+// transparentChain are the link methods that pass the payload through.
+var transparentChain = map[string]bool{
+	"then": true, "catch": true, "finally": true, "json": true, "text": true,
+	"blob": true, "arrayBuffer": true, "data": true, "body": true,
+	"response": true, "result": true, "value": true,
+}
+
+// responseMethods are payload methods, not schema fields.
+var responseMethods = map[string]bool{
+	"map": true, "filter": true, "forEach": true, "reduce": true, "find": true,
+	"findIndex": true, "some": true, "every": true, "sort": true, "flat": true,
+	"flatMap": true, "push": true, "pop": true, "shift": true, "unshift": true,
+	"splice": true, "slice": true, "concat": true, "join": true, "split": true,
+	"includes": true, "indexOf": true, "lastIndexOf": true, "keys": true,
+	"values": true, "entries": true, "toString": true, "trim": true,
+	"replace": true, "replaceAll": true, "toFixed": true, "toPrecision": true,
+	"padStart": true, "padEnd": true, "charAt": true, "substring": true,
+	"substr": true, "toUpperCase": true, "toLowerCase": true, "startsWith": true,
+	"endsWith": true, "repeat": true, "match": true, "getTime": true,
+	"toISOString": true, "toLocaleString": true, "toDateString": true,
+}
+
+// collectionMethods iterate a payload collection; their callback parameter is
+// an element of that collection.
+var collectionMethods = map[string]bool{
+	"map": true, "forEach": true, "filter": true, "find": true, "findIndex": true,
+	"flatMap": true, "some": true, "every": true, "sort": true, "reduce": true,
+}
+
+// fieldKindHints maps a payload method to the schema kind it implies.
+var fieldKindHints = map[string]string{
+	"map": "array", "forEach": "array", "filter": "array", "find": "object",
+	"length": "array", "then": "promise", "json": "promise",
+	"toFixed": "number", "toPrecision": "number", "getTime": "date",
+	"toISOString": "date", "toDateString": "date", "toUpperCase": "string",
+	"toLowerCase": "string", "trim": "string", "split": "array",
+	"includes": "array", "charAt": "string", "replace": "string",
+	"toString": "any", "keys": "object", "entries": "array",
+}
+
+// chainEndpoint walks a promise/HTTP chain down to the request that produced
+// it and returns that endpoint's absolute URL ("" when the chain holds no
+// recognized request).
+func (c *context) chainEndpoint(e expr) string {
+	switch n := e.(type) {
+	case *callExpr:
+		if me, ok := n.callee.(*memberExpr); ok && transparentChain[me.property] {
+			return c.chainEndpoint(me.object)
+		}
+		return c.requestURL(n)
+	case *memberExpr:
+		if transparentChain[n.property] {
+			return c.chainEndpoint(n.object)
+		}
+	}
+	return ""
+}
+
+// requestURL resolves the endpoint a request call points at without recording
+// an observation.
+func (c *context) requestURL(ce *callExpr) string {
+	match, _, _, _ := c.resolveCall(ce)
+	if match == callNone {
+		return ""
+	}
+	if match == callXHROpen {
+		if len(ce.args) > 1 {
+			return resolveEndpoint(c.evalExpr(ce.args[1]), c.sourceURL)
+		}
+		return ""
+	}
+	if len(ce.args) == 0 {
+		return ""
+	}
+	if _, ok := ce.args[0].(*objectExpr); ok {
+		return ""
+	}
+	return resolveEndpoint(c.resolveURLArg(ce.args[0]), c.sourceURL)
+}
+
+// bindResponse binds the first callback parameter to the endpoint and records
+// every field read off the response inside the callback body.
+func (c *context) bindResponse(args []expr, endpoint string) {
+	if len(args) == 0 || endpoint == "" {
+		return
+	}
+	fe, ok := args[0].(*funcExpr)
+	if !ok || fe.body == nil || len(fe.params) == 0 || fe.params[0] == "" {
+		return
+	}
+	name := fe.params[0]
+	prev, had := c.respVar[name]
+	c.respVar[name] = endpoint
+	c.collectRespStmt(fe.body, endpoint)
+	if had {
+		c.respVar[name] = prev
+	} else {
+		delete(c.respVar, name)
+	}
+}
+
+// recordRespField stores one response field path with its inferred kind.
+func (c *context) recordRespField(endpoint, path, kind string) {
+	if path == "" || endpoint == "" {
+		return
+	}
+	set := c.respField[endpoint]
+	if set == nil {
+		set = map[string]string{}
+		c.respField[endpoint] = set
+	}
+	if prev, ok := set[path]; ok && prev != "any" {
+		return
+	}
+	set[path] = kind
+}
+
+// respPath resolves an expression to the response field path it reads. The
+// response root resolves to an empty path; element callback parameters
+// resolve to their collection prefix, so x.price inside
+// res.items.map(x => x.price) lands on "items[].price".
+func (c *context) respPath(e expr) (string, bool) {
+	switch n := e.(type) {
+	case *identExpr:
+		if _, found := c.respVar[n.name]; found {
+			return "", true
+		}
+		if prefix, found := c.respElem[n.name]; found {
+			return prefix, true
+		}
+		return "", false
+	case *memberExpr:
+		base, ok := c.respPath(n.object)
+		if !ok {
+			return "", false
+		}
+		if base == "" {
+			return n.property, true
+		}
+		return base + "." + n.property, true
+	case *callExpr:
+		me, isMember := n.callee.(*memberExpr)
+		if !isMember {
+			return "", false
+		}
+		if responseMethods[me.property] || transparentChain[me.property] {
+			// A payload method (map/json/toFixed…) is not a field itself: the
+			// field is what the method is invoked on.
+			return c.respPath(me.object)
+		}
+		base, ok := c.respPath(me)
+		if !ok {
+			return "", false
+		}
+		if len(n.args) > 0 {
+			return base + "[]", true
+		}
+		return base, true
+	}
+	return "", false
+}
+
+func (c *context) collectRespStmt(s stmt, endpoint string) {
+	switch n := s.(type) {
+	case *blockStmt:
+		for _, st := range n.stmts {
+			c.collectRespStmt(st, endpoint)
+		}
+	case *varDecl:
+		c.collectRespExpr(n.init, endpoint)
+	case *exprStmt:
+		c.collectRespExpr(n.expr, endpoint)
+	case *ifStmt:
+		c.collectRespExpr(n.condition, endpoint)
+		c.collectRespStmt(n.consequent, endpoint)
+		c.collectRespStmt(n.alternate, endpoint)
+	case *forStmt:
+		c.collectRespStmt(n.init, endpoint)
+		c.collectRespStmt(n.body, endpoint)
+	case *whileStmt:
+		c.collectRespExpr(n.condition, endpoint)
+		c.collectRespStmt(n.body, endpoint)
+	case *funcDecl:
+		if n.body != nil {
+			c.collectRespStmt(n.body, endpoint)
+		}
+	case *returnStmt:
+		c.collectRespExpr(n.expr, endpoint)
+	}
+}
+
+func (c *context) collectRespExpr(e expr, endpoint string) {
+	switch n := e.(type) {
+	case *memberExpr:
+		if path, ok := c.respPath(n); ok {
+			kind := "any"
+			if k, hinted := fieldKindHints[n.property]; hinted {
+				kind = k
+			}
+			c.recordRespField(endpoint, path, kind)
+		} else {
+			c.collectRespExpr(n.object, endpoint)
+		}
+	case *callExpr:
+		c.collectCallResp(n, endpoint)
+	case *newExpr:
+		for _, a := range n.args {
+			c.collectRespExpr(a, endpoint)
+		}
+	case *binaryExpr:
+		c.collectRespExpr(n.left, endpoint)
+		c.collectRespExpr(n.right, endpoint)
+	case *unaryExpr:
+		c.collectRespExpr(n.expr, endpoint)
+	case *arrayExpr:
+		for _, el := range n.elements {
+			c.collectRespExpr(el, endpoint)
+		}
+	case *objectExpr:
+		for _, p := range n.properties {
+			c.collectRespExpr(p.value, endpoint)
+		}
+	case *seqExpr:
+		for _, el := range n.exprs {
+			c.collectRespExpr(el, endpoint)
+		}
+	case *templateExpr:
+		for _, part := range n.parts {
+			c.collectRespExpr(part, endpoint)
+		}
+	case *funcExpr:
+		if n.body != nil {
+			for _, st := range n.body.stmts {
+				c.collectRespStmt(st, endpoint)
+			}
+		}
+	}
+}
+
+// collectCallResp records a method call on the payload and, for collection
+// methods, binds the callback parameter so element property reads are recorded
+// under the collection path.
+func (c *context) collectCallResp(n *callExpr, endpoint string) {
+	if me, isMember := n.callee.(*memberExpr); isMember {
+		if path, ok := c.respPath(n); ok && path != "" {
+			kind := "any"
+			if k, hinted := fieldKindHints[me.property]; hinted {
+				kind = k
+			}
+			c.recordRespField(endpoint, path, kind)
+			if collectionMethods[me.property] {
+				c.bindElemCallbacks(n.args, endpoint, path)
+			}
+		}
+	}
+	for _, a := range n.args {
+		c.collectRespExpr(a, endpoint)
+	}
+}
+
+// bindElemCallbacks binds the first parameter of collection callbacks to the
+// collection prefix ("items[]") for the duration of the callback body.
+func (c *context) bindElemCallbacks(args []expr, endpoint, path string) {
+	prefix := strings.TrimSuffix(path, "[]") + "[]"
+	for _, a := range args {
+		fe, ok := a.(*funcExpr)
+		if !ok || fe.body == nil || len(fe.params) == 0 || fe.params[0] == "" {
+			continue
+		}
+		name := fe.params[0]
+		prev, had := c.respElem[name]
+		c.respElem[name] = prefix
+		for _, st := range fe.body.stmts {
+			c.collectRespStmt(st, endpoint)
+		}
+		if had {
+			c.respElem[name] = prev
+		} else {
+			delete(c.respElem, name)
+		}
+	}
 }
 
 func memberChain(node expr) []string {
@@ -1960,7 +2292,7 @@ func (p *parser) parseExpr(minPrec int) expr {
 		p.advance()
 		if p.peek().typ == tokOp && p.peek().value == "=>" {
 			p.advance()
-			left = p.parseArrowBody()
+			left = p.parseArrowBody([]string{t.value})
 		} else {
 			left = &identExpr{name: t.value}
 		}
@@ -1996,13 +2328,13 @@ func (p *parser) parseExpr(minPrec int) expr {
 		case "async":
 			p.advance()
 			if p.peek().typ == tokPunct && p.peek().value == "(" && p.isArrowAhead() {
-				p.consumeArrowHeader()
-				left = p.parseArrowBody()
+				params := p.consumeArrowHeader()
+				left = p.parseArrowBody(params)
 			} else if p.peek().typ == tokIdent {
 				p.advance()
 				if p.peek().typ == tokOp && p.peek().value == "=>" {
 					p.advance()
-					left = p.parseArrowBody()
+					left = p.parseArrowBody([]string{t.value})
 				} else {
 					left = &identExpr{name: t.value}
 				}
@@ -2048,8 +2380,8 @@ func (p *parser) parseExpr(minPrec int) expr {
 		if t.value == "(" {
 			p.advance()
 			if p.isArrowAhead() {
-				p.consumeArrowHeader()
-				left = p.parseArrowBody()
+				params := p.consumeArrowHeader()
+				left = p.parseArrowBody(params)
 			} else {
 				expr := p.parseExpr(0)
 				p.expect(tokPunct, ")")
@@ -2270,8 +2602,11 @@ func (p *parser) isArrowAhead() bool {
 }
 
 // consumeArrowHeader skips the parameter list "(…)" and the following "=>" of
-// an arrow function. The caller guarantees isArrowAhead() was true.
-func (p *parser) consumeArrowHeader() {
+// an arrow function, returning the captured parameter names. The caller
+// guarantees isArrowAhead() was true.
+func (p *parser) consumeArrowHeader() []string {
+	var params []string
+	expectName := true
 	if p.peek().typ == tokPunct && p.peek().value == "(" {
 		p.advance()
 	}
@@ -2279,7 +2614,7 @@ func (p *parser) consumeArrowHeader() {
 	for depth > 0 {
 		t := p.peek()
 		if t.typ == tokEOF {
-			return
+			return params
 		}
 		if t.typ == tokPunct {
 			switch t.value {
@@ -2287,20 +2622,28 @@ func (p *parser) consumeArrowHeader() {
 				depth++
 			case ")", "]", "}":
 				depth--
+			case ",":
+				if depth == 1 {
+					expectName = true
+				}
 			}
+		} else if t.typ == tokIdent && depth == 1 && expectName {
+			params = append(params, t.value)
+			expectName = false
 		}
 		p.advance()
 	}
 	p.advance() // "=>"
+	return params
 }
 
 // parseArrowBody parses the body of an arrow function (block or expression).
-func (p *parser) parseArrowBody() *funcExpr {
+func (p *parser) parseArrowBody(params []string) *funcExpr {
 	if p.peek().typ == tokPunct && p.peek().value == "{" {
-		return &funcExpr{body: p.parseBlockStmt()}
+		return &funcExpr{body: p.parseBlockStmt(), params: params}
 	}
 	e := p.parseExpr(0)
-	return &funcExpr{body: &blockStmt{stmts: []stmt{&exprStmt{expr: e}}}}
+	return &funcExpr{body: &blockStmt{stmts: []stmt{&exprStmt{expr: e}}}, params: params}
 }
 
 func (p *parser) isObjectLiteral() bool {
@@ -2629,7 +2972,8 @@ type funcDecl struct {
 func (*funcDecl) stmtNode() {}
 
 type funcExpr struct {
-	body *blockStmt
+	body   *blockStmt
+	params []string
 }
 
 func (*funcExpr) exprNode() {}

@@ -39,6 +39,16 @@ type Observation struct {
 	Method  string
 	Headers []NameValue
 	Body    string
+	// ResponseFields holds the response schema paths statically inferred from
+	// the code that consumes the endpoint's response.
+	ResponseFields []ResponseField
+}
+
+// ResponseField is one field path read off an endpoint's response, with the
+// kind inferred from how the code uses it (array, object, number, date, …).
+type ResponseField struct {
+	Path string
+	Kind string
 }
 
 // Field describes one parameter or body field: its inferred format and the
@@ -68,9 +78,29 @@ type Endpoint struct {
 	Query   []Field
 	Headers []Field
 	Bodies  []BodyFormat
-	Calls   int
+	// Response is the statically inferred response schema of this endpoint.
+	Response []ResponseField
+	Calls    int
 	// Raw holds one masked rendition per unique request (context/evidence).
 	Raw []string
+}
+
+// addResponseField merges one inferred response field, keeping the first
+// non-generic kind seen for a path.
+func addResponseField(fields []ResponseField, f ResponseField) []ResponseField {
+	for i := range fields {
+		if fields[i].Path != f.Path {
+			continue
+		}
+		if fields[i].Kind == "any" && f.Kind != "" && f.Kind != "any" {
+			fields[i].Kind = f.Kind
+		}
+		return fields
+	}
+	if f.Path == "" {
+		return fields
+	}
+	return append(fields, f)
 }
 
 // tokenish matches names that usually carry secrets/session values.
@@ -153,6 +183,9 @@ func Infer(obs []Observation) []Endpoint {
 			e.Query = addValue(e.Query, k, vs...)
 		}
 		mergeBody(e, o.Body, contentType(o.Headers))
+		for _, f := range o.ResponseFields {
+			e.Response = addResponseField(e.Response, f)
+		}
 		if len(e.Raw) < maxRaw {
 			e.Raw = addString(e.Raw, renderRequest(o))
 		}
@@ -179,6 +212,7 @@ func (e *Endpoint) sort() {
 	sort.Strings(e.Methods)
 	sort.Slice(e.Query, func(i, j int) bool { return e.Query[i].Name < e.Query[j].Name })
 	sort.Slice(e.Headers, func(i, j int) bool { return e.Headers[i].Name < e.Headers[j].Name })
+	sort.Slice(e.Response, func(i, j int) bool { return e.Response[i].Path < e.Response[j].Path })
 	sort.Slice(e.Bodies, func(i, j int) bool {
 		if e.Bodies[i].Kind != e.Bodies[j].Kind {
 			return e.Bodies[i].Kind < e.Bodies[j].Kind
@@ -794,6 +828,10 @@ func render(eps []Endpoint, raw bool, col bool) string {
 			b.WriteString(paint(col, color.Dim, "  bodies:\n"))
 			renderBodies(&b, e.Bodies, col)
 		}
+		if len(e.Response) > 0 {
+			b.WriteString(paint(col, color.Dim, "  response:\n"))
+			renderResponseFields(&b, e.Response, col)
+		}
 		if raw && len(e.Raw) > 0 {
 			b.WriteString(paint(col, color.Dim, "  requests:\n"))
 			for _, r := range e.Raw {
@@ -876,6 +914,36 @@ func joinValues(vals []string) string {
 		out += fmt.Sprintf(" (+%d more)", len(vals)-10)
 	}
 	return out
+}
+
+// renderResponseFields prints the statically inferred response schema: one
+// indented path per line with the kind inferred from its usage.
+func renderResponseFields(b *strings.Builder, fields []ResponseField, col bool) {
+	for _, f := range fields {
+		kind := f.Kind
+		if kind == "" {
+			kind = "any"
+		}
+		b.WriteString("    " + paint(col, responseKindColor(kind), kind) + " " + paint(col, color.Dim, f.Path) + "\n")
+	}
+}
+
+func responseKindColor(kind string) color.Code {
+	switch kind {
+	case "array":
+		return color.Yellow
+	case "object":
+		return color.Green
+	case "number":
+		return color.Cyan
+	case "string":
+		return color.Blue
+	case "date":
+		return color.Purple
+	case "promise":
+		return color.DarkGray
+	}
+	return color.DarkGray
 }
 
 func renderBodies(b *strings.Builder, bodies []BodyFormat, col bool) {

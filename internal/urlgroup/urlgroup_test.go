@@ -17,7 +17,7 @@ func TestBuildURLsNumericGrouping(t *testing.T) {
 		t.Fatalf("expected 1 group, got %d: %+v", len(groups), groups)
 	}
 	g := groups[0]
-	if g.Pattern != "https://hatuli.ai-groundtruth.com/admin/complex/{id}/contacts" {
+	if g.Pattern != "https://hatuli.ai-groundtruth.com/admin/complex/{id: int}/contacts" {
 		t.Fatalf("unexpected pattern: %s", g.Pattern)
 	}
 	if g.Count != 3 {
@@ -45,7 +45,7 @@ func TestBuildURLsStringLiteralGrouping(t *testing.T) {
 		t.Fatalf("expected 1 group, got %d: %+v", len(groups), groups)
 	}
 	g := groups[0]
-	if g.Pattern != "https://host/user/{id}" {
+	if g.Pattern != "https://host/user/{id: string}" {
 		t.Fatalf("unexpected pattern: %s", g.Pattern)
 	}
 	if g.GroupedBy() != "string" {
@@ -83,7 +83,7 @@ func TestBuildURLsSlugAndTokenKinds(t *testing.T) {
 		"https://h/blog/my-awesome-post",
 		"https://h/blog/other-topic-here",
 	}, 2)[0]
-	if slug.Pattern != "https://h/blog/{id}" || slug.GroupedBy() != "string" {
+	if slug.Pattern != "https://h/blog/{id: string}" || slug.GroupedBy() != "string" {
 		t.Fatalf("slug group mismatch: %s / %q", slug.Pattern, slug.GroupedBy())
 	}
 
@@ -91,7 +91,7 @@ func TestBuildURLsSlugAndTokenKinds(t *testing.T) {
 		"https://h/asset/550e8400-e29b-41d4-a716-446655440000",
 		"https://h/asset/6ba7b810-9dad-11d1-80b4-00c04fd430c8",
 	}, 2)[0]
-	if uuid.Pattern != "https://h/asset/{id}" || uuid.GroupedBy() != "uuid" {
+	if uuid.Pattern != "https://h/asset/{id: uuid}" || uuid.GroupedBy() != "uuid" {
 		t.Fatalf("uuid group mismatch: %s / %q", uuid.Pattern, uuid.GroupedBy())
 	}
 	if uuid.Annotation() != "(uuid: id)" {
@@ -102,7 +102,7 @@ func TestBuildURLsSlugAndTokenKinds(t *testing.T) {
 		"https://h/f/0123456789abcdef1234567890abcdef",
 		"https://h/f/abcdef0123456789abcdef0123456789",
 	}, 2)[0]
-	if hash.Pattern != "https://h/f/{id}" || hash.GroupedBy() != "hash" {
+	if hash.Pattern != "https://h/f/{id: hash}" || hash.GroupedBy() != "hash" {
 		t.Fatalf("hash group mismatch: %s / %q", hash.Pattern, hash.GroupedBy())
 	}
 
@@ -110,7 +110,7 @@ func TestBuildURLsSlugAndTokenKinds(t *testing.T) {
 		"https://h/t/dGhpcyBpcyBhIGJhc2U2NHBheWxvYWR6IL==",
 		"https://h/t/U3lzdGVtL0ludGVyZmFjZQ==",
 	}, 2)[0]
-	if b64.Pattern != "https://h/t/{id}" || b64.GroupedBy() != "base64" {
+	if b64.Pattern != "https://h/t/{id: base64}" || b64.GroupedBy() != "base64" {
 		t.Fatalf("base64 group mismatch: %s / %q", b64.Pattern, b64.GroupedBy())
 	}
 	if b64.Annotation() != "(base64: id)" {
@@ -138,20 +138,20 @@ func TestBuildURLsMultiVar(t *testing.T) {
 		"https://h/report/2024/q2",
 		"https://h/report/2025/q2",
 	}, 2)
-	g := findByPattern(t, groups, "https://h/report/{id}/{id2}")
+	g := findByPattern(t, groups, "https://h/report/{id1: int}/{id2: string}")
 	if g.Count != 4 {
 		t.Fatalf("expected 4 members, got %d", g.Count)
 	}
 	if g.GroupedBy() != "int,string" {
 		t.Fatalf("expected int,string, got %q", g.GroupedBy())
 	}
-	if g.Annotation() != "(int: id, string: id2)" {
+	if g.Annotation() != "(int: id1, string: id2)" {
 		t.Fatalf("unexpected annotation: %q", g.Annotation())
 	}
 	if len(g.Vars) != 2 {
 		t.Fatalf("expected 2 vars, got %d", len(g.Vars))
 	}
-	if got := g.VarDescriptor(0); got != "id(int): 2024..2025" {
+	if got := g.VarDescriptor(0); got != "id1(int): 2024..2025" {
 		t.Fatalf("unexpected first var: %q", got)
 	}
 	if got := g.VarDescriptor(1); got != "id2(string): q1, q2" {
@@ -178,13 +178,13 @@ func TestMatchURL(t *testing.T) {
 		"http://h/admin/complex/9224/access",
 	}, 2)
 	cases := []struct{ raw, want string }{
-		{"http://h/admin/complex/9223/contacts", "http://h/admin/complex/{id}/contacts"},
-		{"http://h/admin/complex/9224/contacts", "http://h/admin/complex/{id}/contacts"},
-		{"http://h/admin/complex/9223/access", "http://h/admin/complex/{id}/access"},
-		{"http://h/admin/complex/9224/access", "http://h/admin/complex/{id}/access"},
+		{"http://h/admin/complex/9223/contacts", "http://h/admin/complex/{id: int}/contacts"},
+		{"http://h/admin/complex/9224/contacts", "http://h/admin/complex/{id: int}/contacts"},
+		{"http://h/admin/complex/9223/access", "http://h/admin/complex/{id: int}/access"},
+		{"http://h/admin/complex/9224/access", "http://h/admin/complex/{id: int}/access"},
 		{"http://h/admin/static/x.js", ""},
 		{"not a url", ""},
-		{"http://h/admin/complex/abc/contacts", "http://h/admin/complex/{id}/contacts"},
+		{"http://h/admin/complex/abc/contacts", "http://h/admin/complex/{id: int}/contacts"},
 	}
 	for _, tc := range cases {
 		if got := MatchURL(tc.raw, groups); got != tc.want {
@@ -254,6 +254,30 @@ func TestCanonical(t *testing.T) {
 	}
 }
 
+func TestSetGroupStringsOff(t *testing.T) {
+	SetGroupStrings(false)
+	defer SetGroupStrings(true)
+	groups := BuildURLs([]string{
+		"https://h/complex/9223/contacts",
+		"https://h/complex/9224/contacts",
+		"https://h/example/name/alice/add",
+		"https://h/example/name/bob/add",
+	}, 2)
+	found := map[string]bool{}
+	for _, g := range groups {
+		found[g.Pattern] = true
+	}
+	if !found["https://h/complex/{id: int}/contacts"] {
+		t.Errorf("typed (int) grouping must survive -nostr, groups: %+v", groups)
+	}
+	for _, p := range groups {
+		if !hasStringVar(p) {
+			continue
+		}
+		t.Errorf("string grouping must be disabled, found %s", p.Pattern)
+	}
+}
+
 func TestDetectorFeed(t *testing.T) {
 	d := NewDetector(2)
 
@@ -273,7 +297,7 @@ func TestDetectorFeed(t *testing.T) {
 	}
 
 	groups := d.Groups()
-	if len(groups) != 1 || groups[0].Pattern != "https://h/complex/{id}/contacts" {
+	if len(groups) != 1 || groups[0].Pattern != "https://h/complex/{id: int}/contacts" {
 		t.Fatalf("unexpected detector groups: %+v", groups)
 	}
 }
@@ -281,10 +305,10 @@ func TestDetectorFeed(t *testing.T) {
 func TestVarRangeNonNumeric(t *testing.T) {
 	v := Var{Kind: "string", Values: []string{"about", "settings", "profile", "blog", "help", "faq", "api"}}
 	got := v.Range()
-	if strings.Count(got, ",") < 4 {
-		t.Fatalf("expected truncated distinct list, got %q", got)
+	if got != "about, settings, profile, blog, help, faq, api" {
+		t.Fatalf("expected one fully joined list, got %q", got)
 	}
-	if !strings.Contains(got, "…") {
-		t.Fatalf("expected truncation marker, got %q", got)
+	if strings.Contains(got, "…") {
+		t.Fatalf("unexpected truncation marker, got %q", got)
 	}
 }

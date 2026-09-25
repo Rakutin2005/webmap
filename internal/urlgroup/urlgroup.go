@@ -34,7 +34,18 @@ var (
 	// maxBucketLen bounds the quadratic pair scan inside BuildURLs so a single
 	// huge path bucket cannot stall the scan.
 	maxBucketLen = 2000
+
+	// groupStrings controls whether generic string-literal variables are allowed
+	// to form patterns. When disabled only typed segments (int, uuid, hash,
+	// base64) group; plain word values never fold.
+	groupStrings = true
 )
+
+// SetGroupStrings enables or disables grouping by string literals. Disabling
+// it drops patterns whose variable slots are plain words, keeping only the
+// type-identifiable ids (numbers, uuids, hashes, base64 tokens). It affects
+// BuildURLs/BuildLinks and thereby the crawl-time Detector too.
+func SetGroupStrings(on bool) { groupStrings = on }
 
 // segmentKind classifies a path segment as a resource identifier. Empty and
 // template-shaped segments report "" (not groupable). Plain words fall through
@@ -154,19 +165,22 @@ func distinctNums(nums []int64) []int64 {
 	return out
 }
 
-func joinCut(vals []string, max int) string {
-	if len(vals) == 0 {
-		return ""
-	}
-	if len(vals) > max {
-		return strings.Join(vals[:max], ", ") + fmt.Sprintf(", …%d more", len(vals)-max)
-	}
+func joinCut(vals []string, _ int) string {
 	return strings.Join(vals, ", ")
 }
 
 // VarLabel returns the display name for the i-th variable slot ("id", "id2", …).
 func VarLabel(i int) string {
 	if i == 0 {
+		return "id"
+	}
+	return fmt.Sprintf("id%d", i+1)
+}
+
+// VarName returns the slot name used inside a pattern: a lone variable is
+// "id", several variables are numbered "id1", "id2", …
+func VarName(i, total int) string {
+	if total == 1 {
 		return "id"
 	}
 	return fmt.Sprintf("id%d", i+1)
@@ -185,6 +199,13 @@ type Group struct {
 
 // Segments returns the pattern path segments (public for tests).
 func (g Group) Segments() []string { return g.segs }
+
+// Members returns the canonical member URLs folded into the pattern.
+func (g Group) Members() []string {
+	out := make([]string, len(g.urls))
+	copy(out, g.urls)
+	return out
+}
 
 // GroupedBy returns the comma-joined set of variable kinds this pattern was
 // grouped by (e.g. "int" or "int,str").
@@ -219,9 +240,9 @@ func (g Group) VarDescriptor(i int) string {
 	}
 	r := v.Range()
 	if r == "" {
-		return fmt.Sprintf("%s(%s)", VarLabel(i), kind)
+		return fmt.Sprintf("%s(%s)", VarName(i, len(g.Vars)), kind)
 	}
-	return fmt.Sprintf("%s(%s): %s", VarLabel(i), kind, r)
+	return fmt.Sprintf("%s(%s): %s", VarName(i, len(g.Vars)), kind, r)
 }
 
 // Annotation renders the grouping type header, e.g. "(int: id)" or
@@ -234,7 +255,7 @@ func (g Group) Annotation() string {
 		if kind == "" {
 			kind = constString
 		}
-		parts = append(parts, kind+": "+VarLabel(i))
+		parts = append(parts, kind+": "+VarName(i, len(g.Vars)))
 	}
 	if len(parts) == 0 {
 		return ""
@@ -273,7 +294,7 @@ func ClusterRanges(groups []Group) []string {
 		if r == "" {
 			r = joinCut(distinctVals(vals), 5)
 		}
-		out = append(out, VarLabel(i)+": "+r)
+		out = append(out, VarName(i, maxVars)+": "+r)
 	}
 	return out
 }
@@ -361,7 +382,14 @@ func BuildURLs(raw []string, minCount int) []Group {
 		if len(members) < minCount {
 			continue
 		}
-		groups = append(groups, buildGroup(key, members, segByURL))
+		g := buildGroup(key, members, segByURL)
+		if catchAll(g) {
+			continue
+		}
+		if !groupStrings && hasStringVar(g) {
+			continue
+		}
+		groups = append(groups, g)
 	}
 	sort.Slice(groups, func(i, j int) bool {
 		if groups[i].Domain != groups[j].Domain {
@@ -436,6 +464,29 @@ func inferVarKind(values []string) string {
 	return kind
 }
 
+// hasStringVar reports whether any variable slot of the group is a plain
+// string literal (used when string grouping is disabled).
+func hasStringVar(g Group) bool {
+	for _, v := range g.Vars {
+		if v.Kind == constString {
+			return true
+		}
+	}
+	return false
+}
+
+// catchAll reports whether the pattern has no literal segment at all
+// (e.g. {id}/{id2}/{id3} under a bare host). Such catch-all shapes absorb
+// unrelated endpoints and convey nothing, so they are never emitted.
+func catchAll(g Group) bool {
+	for _, s := range g.segs {
+		if !strings.Contains(s, "{") {
+			return false
+		}
+	}
+	return true
+}
+
 func buildGroup(key string, members map[string]bool, segByURL map[string][]string) Group {
 	host, keySegs := parseMaskKey(key)
 	urls := make([]string, 0, len(members))
@@ -445,17 +496,21 @@ func buildGroup(key string, members map[string]bool, segByURL map[string][]strin
 	sort.Strings(urls)
 
 	pat := make([]string, len(keySegs))
-	vars := make([]Var, 0)
+	slots := 0
+	for _, lit := range keySegs {
+		if lit == "" {
+			slots++
+		}
+	}
+	vars := make([]Var, slots)
 	slot := 0
 	for i, lit := range keySegs {
-		if lit == "" {
-			name := VarLabel(slot)
-			pat[i] = "{" + name + "}"
-			vars = append(vars, Var{})
-			slot++
-		} else {
+		if lit != "" {
 			pat[i] = lit
+			continue
 		}
+		vars[slot] = Var{}
+		slot++
 	}
 	for _, u := range urls {
 		ss := segByURL[u]
@@ -474,6 +529,14 @@ func buildGroup(key string, members map[string]bool, segByURL map[string][]strin
 			if nums, ok := parseNums(vars[i].Values); ok {
 				vars[i].Nums = nums
 			}
+		}
+	}
+	// Typed placeholders: /developer/{id: int}, /webp/{id1: int}/{id2: int}.
+	slot = 0
+	for i, lit := range keySegs {
+		if lit == "" {
+			pat[i] = "{" + VarName(slot, slots) + ": " + vars[slot].Kind + "}"
+			slot++
 		}
 	}
 
@@ -512,10 +575,16 @@ func LinkKey(l linker.Link) string {
 	return l.HREF
 }
 
-// BuildLinks folds a set of links into patterns (see BuildURLs).
+// BuildLinks folds a set of links into patterns (see BuildURLs). API links are
+// deliberately left alone: endpoints are reported as API contracts with their
+// own methods, parameters and response schemas instead of being collapsed into
+// a URL pattern.
 func BuildLinks(links []linker.Link, minCount int) []Group {
 	raw := make([]string, 0, len(links))
 	for _, l := range links {
+		if l.Category == linker.CategoryAPI || l.Category == linker.CategoryDynamic {
+			continue
+		}
 		raw = append(raw, LinkKey(l))
 	}
 	return BuildURLs(raw, minCount)

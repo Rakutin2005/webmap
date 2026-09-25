@@ -36,6 +36,15 @@ var lastEmuSummary *emulator.Summary
 // (concrete URLs matching a pattern are folded into the pattern endpoint).
 var activeGroups []urlgroup.Group
 
+// activeLinkByURL maps a canonical URL to its source link so pattern lines can
+// be classified with the standard artifact rules (category, asset subtype,
+// link type, URL class) even when the members were deduplicated.
+var activeLinkByURL map[string]linker.Link
+
+// contractPatterns holds the pattern URLs that have at least one API contract
+// observation; such patterns render with a <contract> marker.
+var contractPatterns map[string]bool
+
 // obsPool accumulates request observations from static JS analysis and browser
 // emulation across the whole scan; contract.Infer turns it into endpoint
 // contracts at the end.
@@ -134,6 +143,11 @@ func canonizeObservations(obs []contract.Observation) []contract.Observation {
 	}
 	out := append([]contract.Observation(nil), obs...)
 	for i := range out {
+		// API observations keep their concrete endpoint: they are reported as
+		// contracts, not folded into a page pattern.
+		if l, ok := activeLinkByURL[out[i].URL]; ok && (l.Category == linker.CategoryAPI || l.Category == linker.CategoryDynamic) {
+			continue
+		}
 		if p := urlgroup.MatchURL(out[i].URL, activeGroups); p != "" {
 			out[i].URL = p
 		}
@@ -166,6 +180,7 @@ func initEmulationLimits(cfg *config.Config) {
 
 func main() {
 	cfg := config.Parse()
+	urlgroup.SetGroupStrings(!cfg.NoStringGroup)
 	if cfg.URL == "" {
 		fmt.Fprintln(os.Stderr, "Error: URL is required")
 		os.Exit(1)
@@ -436,45 +451,167 @@ func formatParamVariants(variants []linker.ParamVariant) string {
 // API-contract output. Grouping is skipped when disabled via -nogroup.
 func applyGrouping(allLinks, displayLinks []linker.Link, cfg *config.Config) []linker.Link {
 	if cfg.NoGroup {
+		activeGroups = nil
+		activeLinkByURL = nil
+		contractPatterns = nil
 		return displayLinks
 	}
 	activeGroups = urlgroup.BuildLinks(allLinks, cfg.GroupCount)
+
+	// Canonical-URL lookup so patterns can be classified from their member
+	// links even after deduplication.
+	byURL := make(map[string]linker.Link, len(allLinks))
+	for _, l := range allLinks {
+		if c, ok := urlgroup.Canonical(l.Resolved); ok {
+			if _, dup := byURL[c]; !dup {
+				byURL[c] = l
+			}
+		}
+	}
+	activeLinkByURL = byURL
+	contractPatterns = computeContractPatterns()
 	return urlgroup.WithoutMembers(displayLinks, activeGroups)
 }
 
-// renderURLPatternsPlain builds the "URL Patterns" section: each line is one
-// annotation cluster "(type: name)" followed by the comma-joined patterns that
-// share it, with instance counts and the merged variable ranges.
-func renderURLPatternsPlain(groups []urlgroup.Group) string {
-	if len(groups) == 0 {
-		return ""
+// computeContractPatterns determines which pattern URLs have an API contract
+// observation: canonicalized observation URLs are exactly the pattern strings.
+func computeContractPatterns() map[string]bool {
+	obsMu.Lock()
+	obs := append([]contract.Observation(nil), obsPool...)
+	obsMu.Unlock()
+	m := make(map[string]bool)
+	for _, o := range canonizeObservations(obs) {
+		m[o.URL] = true
 	}
-	clusters := map[string][]urlgroup.Group{}
-	var order []string
-	for _, g := range groups {
-		ann := g.Annotation()
-		if _, ok := clusters[ann]; !ok {
-			order = append(order, ann)
-		}
-		clusters[ann] = append(clusters[ann], g)
-	}
-	sort.Strings(order)
+	return m
+}
 
-	var b strings.Builder
-	b.WriteString("\n=== URL Patterns ===\n")
-	for _, ann := range order {
-		gs := clusters[ann]
-		var parts []string
-		for _, g := range gs {
-			parts = append(parts, fmt.Sprintf("%s (%d)", g.Pattern, g.Count))
+// patternMeta aggregates the standard artifact classification of a pattern's
+// concrete member links: category, asset subtype, link type and URL class. A
+// pattern is not a category of its own — it is a folded view of artifacts and
+// is therefore classified by the same rules as any other link.
+type patternMeta struct {
+	category linker.Category
+	asset    color.AssetSubtype
+	linkType linker.LinkType
+	class    linker.URLClass
+}
+
+var (
+	catPriority   = []int{int(linker.CategoryAPI), int(linker.CategoryDynamic), int(linker.CategoryWebPage), int(linker.CategoryWebAsset)}
+	typePriority  = []int{int(linker.LinkTypeAbsolute), int(linker.LinkTypeRelative), int(linker.LinkTypeWeb)}
+	classPriority = []int{int(linker.ClassCDN), int(linker.ClassWAF), int(linker.ClassCache), int(linker.ClassNoise)}
+	assetPriority = []int{int(color.AssetJS), int(color.AssetCSS), int(color.AssetImage), int(color.AssetFont), int(color.AssetMedia), int(color.AssetDoc), int(color.AssetData), int(color.AssetOther)}
+)
+
+func majority(tally map[int]int, priority []int) int {
+	best, bestN := 0, 0
+	for _, p := range priority {
+		if tally[p] > bestN {
+			best, bestN = p, tally[p]
 		}
-		line := "  " + ann + " " + strings.Join(parts, ", ")
-		if ranges := urlgroup.ClusterRanges(gs); len(ranges) > 0 {
-			line += "  [" + strings.Join(ranges, ", ") + "]"
-		}
-		b.WriteString(wrapLine(line, 120) + "\n")
 	}
-	return b.String()
+	return best
+}
+
+func aggregatePattern(g urlgroup.Group) patternMeta {
+	cats, types, classes, assets := map[int]int{}, map[int]int{}, map[int]int{}, map[int]int{}
+	for _, u := range g.Members() {
+		l, ok := activeLinkByURL[u]
+		if !ok {
+			continue
+		}
+		cats[int(l.Category)]++
+		types[int(l.LinkType)]++
+		classes[int(l.Class)]++
+		if l.Category == linker.CategoryWebAsset {
+			assets[int(color.ClassifyAsset(l.HREF))]++
+		}
+	}
+	m := patternMeta{
+		category: linker.Category(majority(cats, catPriority)),
+		linkType: linker.LinkType(majority(types, typePriority)),
+		asset:    color.AssetSubtype(majority(assets, assetPriority)),
+		class:    linker.ClassNormal,
+	}
+	// A class is only shown when it actually dominates the pattern members.
+	bestN := classes[int(linker.ClassNormal)]
+	for _, c := range classPriority {
+		if classes[c] > bestN {
+			m.class = linker.URLClass(c)
+			bestN = classes[c]
+		}
+	}
+	return m
+}
+
+// patternCategoryLabel names the artifact kind in the category column.
+func patternCategoryLabel(m patternMeta) string {
+	switch m.category {
+	case linker.CategoryAPI:
+		return "api"
+	case linker.CategoryDynamic:
+		return "dynamic"
+	case linker.CategoryWebPage:
+		return "html"
+	case linker.CategoryWebAsset:
+		return color.AssetLabel(m.asset)
+	}
+	return "unknown"
+}
+
+func patternCategoryIcon(m patternMeta) string {
+	switch m.category {
+	case linker.CategoryAPI:
+		return "API"
+	case linker.CategoryDynamic:
+		return "DYN"
+	case linker.CategoryWebPage:
+		return "PAG"
+	case linker.CategoryWebAsset:
+		return strings.ToUpper(color.AssetLabel(m.asset))
+	}
+	return "?"
+}
+
+func patternCategoryColor(m patternMeta) color.Code {
+	switch m.category {
+	case linker.CategoryAPI:
+		return color.Cyan
+	case linker.CategoryDynamic:
+		return color.Purple
+	case linker.CategoryWebPage:
+		return color.Green
+	case linker.CategoryWebAsset:
+		return color.AssetColor(m.asset)
+	}
+	return color.White
+}
+
+func patternTypeColor(t linker.LinkType) color.Code {
+	switch t {
+	case linker.LinkTypeAbsolute:
+		return color.Cyan
+	case linker.LinkTypeRelative:
+		return color.Yellow
+	case linker.LinkTypeWeb:
+		return color.DarkYellow
+	}
+	return color.White
+}
+
+func patternClassColor(c linker.URLClass) color.Code {
+	switch c {
+	case linker.ClassWAF:
+		return color.Red
+	case linker.ClassCDN:
+		return color.Yellow
+	case linker.ClassCache:
+		return color.DarkYellow
+	case linker.ClassNoise:
+		return color.DarkGray
+	}
+	return color.Gray
 }
 
 // kindColor maps a grouping kind to its output color.
@@ -495,48 +632,62 @@ func kindColor(kind string) color.Code {
 	}
 }
 
-// renderURLPatternsColored is the colorized variant of renderURLPatternsPlain.
-func renderURLPatternsColored(groups []urlgroup.Group) string {
+// patternRanges renders the observed values of every slot of one pattern.
+func patternRanges(g urlgroup.Group) string {
+	return strings.Join(urlgroup.ClusterRanges([]urlgroup.Group{g}), ", ")
+}
+
+// renderURLPatternsPlain lists every confirmed pattern as a folded artifact
+// row: standard classification columns (link type, category, domain), the
+// pattern itself with typed placeholders, the instance count and the values.
+func renderURLPatternsPlain(groups []urlgroup.Group) string {
 	if len(groups) == 0 {
 		return ""
 	}
-	clusters := map[string][]urlgroup.Group{}
-	var order []string
+	var b strings.Builder
+	b.WriteString("\n=== URL Patterns ===\n")
 	for _, g := range groups {
-		ann := g.Annotation()
-		if _, ok := clusters[ann]; !ok {
-			order = append(order, ann)
+		m := aggregatePattern(g)
+		classTag := ""
+		if m.class != linker.ClassNormal {
+			classTag = " [" + m.class.String() + "]"
 		}
-		clusters[ann] = append(clusters[ann], g)
+		contract := ""
+		if contractPatterns[g.Pattern] {
+			contract = " <contract>"
+		}
+		line := fmt.Sprintf("  %-6s %-5s %-7s %-22s %s  x%-4d [%s]%s%s",
+			m.linkType.String(), patternCategoryIcon(m), patternCategoryLabel(m),
+			truncate(g.Domain, 22), g.Pattern, g.Count, patternRanges(g), classTag, contract)
+		b.WriteString(wrapLine(line, 120) + "\n")
 	}
-	sort.Strings(order)
+	return b.String()
+}
 
+// renderURLPatternsColored is the colorized variant of renderURLPatternsPlain.
+func renderURLPatternsColored(groups []urlgroup.Group, baseHost string) string {
+	if len(groups) == 0 {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString("\n" + color.Colorize(color.Bold, "=== URL Patterns ===") + "\n")
-	for _, ann := range order {
-		gs := clusters[ann]
-		var parts []string
-		for _, g := range gs {
-			parts = append(parts, color.Colorize(color.White, g.Pattern)+" "+color.Colorizef(color.Dim, "(%d)", g.Count))
+	for _, g := range groups {
+		m := aggregatePattern(g)
+		typeStr := color.Colorizef(patternTypeColor(m.linkType), "%-6s", m.linkType.String())
+		cat := color.Colorizef(patternCategoryColor(m), "%-5s %-7s", patternCategoryIcon(m), patternCategoryLabel(m))
+		dt := color.ClassifyDomain(g.Domain, baseHost)
+		domain := color.Colorizef(color.DomainColor(dt), "%-22s", truncate(g.Domain, 22))
+		pat := color.Colorize(color.DarkBlue, g.Pattern)
+		cnt := color.Colorizef(color.Dim, "  x%d", g.Count)
+		ranges := color.Colorize(color.Dim, "["+patternRanges(g)+"]")
+		tail := ""
+		if m.class != linker.ClassNormal {
+			tail += color.Colorizef(patternClassColor(m.class), " [%s]", m.class.String())
 		}
-		var kp []string
-		for i, v := range gs[0].Vars {
-			kind := v.Kind
-			if kind == "" {
-				kind = "string"
-			}
-			kp = append(kp, color.Colorize(kindColor(kind), kind)+color.Colorize(color.Bold, ": "+urlgroup.VarLabel(i)))
+		if contractPatterns[g.Pattern] {
+			tail += color.Colorize(color.DarkGreen, " <contract>")
 		}
-		coloredAnn := "(" + strings.Join(kp, ", ") + ")"
-		line := "  " + coloredAnn + " " + strings.Join(parts, ", ")
-		if ranges := urlgroup.ClusterRanges(gs); len(ranges) > 0 {
-			var rp []string
-			for _, r := range ranges {
-				rp = append(rp, color.Colorize(color.Dim, r))
-			}
-			line += "  [" + strings.Join(rp, ", ") + "]"
-		}
-		b.WriteString(wrapLine(line, 120) + "\n")
+		b.WriteString(wrapLine("  "+typeStr+" "+cat+" "+domain+" "+pat+cnt+" "+ranges+tail, 120) + "\n")
 	}
 	return b.String()
 }
@@ -1388,7 +1539,7 @@ func printColorResults(allLinks, displayLinks []linker.Link, stats *categorizer.
 		fmt.Println("    none")
 	}
 
-	patternsSection := renderURLPatternsColored(groups)
+	patternsSection := renderURLPatternsColored(groups, baseHost)
 	if patternsSection != "" {
 		fmt.Print(patternsSection)
 	}
