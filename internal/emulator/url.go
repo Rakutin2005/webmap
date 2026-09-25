@@ -49,12 +49,12 @@ func (vm *gojaVM) injectURL() {
 	})
 }
 
-// newSearchParams returns a goja object backed by an ordered key/value list,
-// plus a pointer to that list so an owning URL can rebuild its query string.
-func (vm *gojaVM) newSearchParams(init string) (*goja.Object, *[]kv) {
-	r := vm.runtime
-	pairs := &[]kv{}
+// parseQuery decodes a query string ("?a=1&b=2") into an ordered key/value
+// list. Used both to build a URLSearchParams and to repopulate the shared list
+// when a URL's search component is reassigned.
+func parseQuery(init string) []kv {
 	init = strings.TrimPrefix(init, "?")
+	var pairs []kv
 	if init != "" {
 		for _, part := range strings.Split(init, "&") {
 			if part == "" {
@@ -63,15 +63,27 @@ func (vm *gojaVM) newSearchParams(init string) (*goja.Object, *[]kv) {
 			k, v, _ := strings.Cut(part, "=")
 			k = jsUnescape(k)
 			v = jsUnescape(v)
-			*pairs = append(*pairs, kv{k, v})
+			pairs = append(pairs, kv{k, v})
 		}
 	}
+	return pairs
+}
+
+// newSearchParams returns a goja object backed by an ordered key/value list,
+// plus a pointer to that list so an owning URL can rebuild its query string.
+func (vm *gojaVM) newSearchParams(init string) (*goja.Object, *[]kv) {
+	r := vm.runtime
+	plist := parseQuery(init)
+	pairs := &plist
 
 	o := r.NewObject()
 	o.Set("append", vm.fn(func(c goja.FunctionCall) goja.Value {
 		*pairs = append(*pairs, kv{c.Argument(0).String(), c.Argument(1).String()})
 		return goja.Undefined()
 	}))
+	// Serializer so passing this URLSearchParams as a fetch/Request body
+	// compiles to its wire encoding during capture.
+	vm.serializers[o] = func() string { return encodePairs(*pairs) }
 	o.Set("set", vm.fn(func(c goja.FunctionCall) goja.Value {
 		k, v := c.Argument(0).String(), c.Argument(1).String()
 		found := false
@@ -162,29 +174,82 @@ func (vm *gojaVM) newURLObject(u *url.URL) *goja.Object {
 	}
 
 	o := r.NewObject()
-	o.Set("protocol", u.Scheme+":")
-	o.Set("hostname", u.Hostname())
-	o.Set("host", u.Host)
-	o.Set("port", u.Port())
-	o.Set("pathname", u.Path)
-	o.Set("hash", func() string {
+
+	// Accessor helper: getter reads the current value, setter mutates shared
+	// state so `u.pathname = '/x'` / `u.href = ...` actually take effect
+	// (previously they were silent no-ops and fetches used a stale URL).
+	def := func(name string, get func() string, set func(string)) {
+		_ = o.DefineAccessorProperty(name,
+			vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue(get()) }),
+			vm.fn(func(call goja.FunctionCall) goja.Value {
+				set(call.Argument(0).String())
+				return goja.Undefined()
+			}),
+			goja.FLAG_TRUE, goja.FLAG_TRUE)
+	}
+
+	def("href", func() string {
+		return build()
+	}, func(v string) {
+		var nu *url.URL
+		var err error
+		if strings.Contains(v, "://") || strings.HasPrefix(v, "//") {
+			nu, err = url.Parse(v)
+		} else {
+			if bu, e := url.Parse(build()); e == nil {
+				nu, err = bu.Parse(v)
+			}
+		}
+		if err == nil && nu != nil {
+			*u = *nu
+		}
+		*pairs = parseQuery(u.RawQuery)
+	})
+	def("search", func() string {
+		q := encodePairs(*pairs)
+		if q != "" {
+			return "?" + q
+		}
+		return ""
+	}, func(v string) {
+		*pairs = parseQuery(v)
+		u.RawQuery = strings.TrimPrefix(v, "?")
+	})
+	def("protocol", func() string { return u.Scheme + ":" }, func(v string) {
+		u.Scheme = strings.TrimSuffix(v, ":")
+	})
+	def("host", func() string { return u.Host }, func(v string) { u.Host = v })
+	def("hostname", func() string { return u.Hostname() }, func(v string) {
+		port := u.Port()
+		v = strings.TrimSuffix(v, ":")
+		if port != "" {
+			u.Host = v + ":" + port
+		} else {
+			u.Host = v
+		}
+	})
+	def("port", func() string { return u.Port() }, func(v string) {
+		if v == "" {
+			u.Host = u.Hostname()
+		} else {
+			u.Host = u.Hostname() + ":" + v
+		}
+	})
+	def("pathname", func() string { return u.Path }, func(v string) { u.Path = v })
+	def("hash", func() string {
 		if u.Fragment != "" {
 			return "#" + u.Fragment
 		}
 		return ""
-	}())
-	o.Set("origin", u.Scheme+"://"+u.Host)
-	o.Set("searchParams", spObj)
-	hrefGetter := vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue(build()) })
-	_ = o.DefineAccessorProperty("href", hrefGetter, vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }), goja.FLAG_TRUE, goja.FLAG_TRUE)
-	searchGetter := vm.fn(func(goja.FunctionCall) goja.Value {
-		q := encodePairs(*pairs)
-		if q != "" {
-			return r.ToValue("?" + q)
+	}, func(v string) { u.Fragment = strings.TrimPrefix(v, "#") })
+	def("origin", func() string {
+		if u.Scheme != "" && u.Host != "" {
+			return u.Scheme + "://" + u.Host
 		}
-		return r.ToValue("")
-	})
-	_ = o.DefineAccessorProperty("search", searchGetter, vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }), goja.FLAG_TRUE, goja.FLAG_TRUE)
+		return "null"
+	}, func(string) {})
+
+	o.Set("searchParams", spObj)
 	o.Set("toString", vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue(build()) }))
 	o.Set("toJSON", vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue(build()) }))
 	return o

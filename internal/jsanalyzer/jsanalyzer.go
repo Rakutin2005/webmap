@@ -1,18 +1,23 @@
 package jsanalyzer
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
 
+	"apimap/internal/contract"
 	"apimap/internal/linker"
 )
 
-func Parse(jsContent string, sourceURL string, fullInfo bool) (result []linker.Link) {
+func Parse(jsContent string, sourceURL string, fullInfo bool) (result []linker.Link, obs []contract.Observation) {
 	defer func() {
 		if r := recover(); r != nil {
 			result = nil
+			obs = nil
 		}
 	}()
 	ctx := newContext(sourceURL, fullInfo)
@@ -22,6 +27,11 @@ func Parse(jsContent string, sourceURL string, fullInfo bool) (result []linker.L
 
 	ctx.analyze(stmts)
 
+	// Token-level scan for HTTP-client calls (client.get/post/...) that the AST
+	// analysis cannot reach — either the parser bailed out on the surrounding
+	// minified code, or the client object is an unrecognized short name.
+	ctx.scanCalls(tokens, jsContent)
+
 	// Robust fallback: many endpoints are built at runtime (e.g.
 	// fetch(this.ajaxUrl + '?' + params)) or live inside config/JSON blobs the
 	// call-graph analysis can't trace back. Harvest endpoint-looking string
@@ -29,7 +39,7 @@ func Parse(jsContent string, sourceURL string, fullInfo bool) (result []linker.L
 	// on tokens (not the AST) so it works even when parsing bails out on minified
 	// or exotic syntax.
 	ctx.harvestTokens(tokens)
-	return ctx.links
+	return ctx.links, ctx.obs
 }
 
 // harvestTokens scans every string and template-literal token for values that
@@ -74,13 +84,181 @@ func (c *context) harvestString(s string, traced []string) {
 	c.addLink(s, "js-str", "string-literal", "")
 }
 
+// tokenCallMethods maps a member name on an HTTP client object to the request
+// method it issues. Used by the token-level fallback scanner, which catches
+// calls on clients that carry arbitrary minified names (e, t, s, ...) that the
+// AST call-graph analysis cannot resolve.
+var tokenCallMethods = map[string]string{
+	"get": "GET", "post": "POST", "put": "PUT",
+	"delete": "DELETE", "patch": "PATCH",
+	"head": "HEAD", "options": "OPTIONS",
+}
+
+// bodyCarryingMethods are the HTTP verbs whose argument list can contain a
+// request body (the second argument).
+var bodyCarryingMethods = map[string]bool{"POST": true, "PUT": true, "PATCH": true, "DELETE": true}
+
+// urlArgShape reports whether a string/template argument is an endpoint-shaped
+// URL reference (absolute path, absolute URL, relative path, or a template that
+// begins with such a prefix). Literal prose or plain identifiers ("next",
+// "name", ...) are rejected.
+func urlArgShape(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	for _, p := range []string{"/", "./", "../", "http://", "https://", "//"} {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return strings.HasPrefix(s, "{") && strings.Contains(s, "/")
+}
+
+// scanCalls is a flat token-stream fallback that finds HTTP-client calls of the
+// form client.get("..."), client.post("/api/...", body), etc. It runs in
+// addition to the AST call-graph analysis so that calls remain visible even
+// when the parser bails out on minified/exotic syntax or the client object has
+// an unrecognized name. Only calls whose first argument is a string/template
+// URL literal are reported; bodies are captured from a literal second argument
+// (string or object/array literal).
+func (c *context) scanCalls(tokens []token, jsContent string) {
+	for i := 0; i < len(tokens); i++ {
+		if tokens[i].typ != tokIdent {
+			continue
+		}
+		method, ok := tokenCallMethods[tokens[i].value]
+		if !ok {
+			continue
+		}
+		if i == 0 || tokens[i-1].typ != tokPunct || tokens[i-1].value != "." {
+			continue
+		}
+		if i+1 >= len(tokens) || tokens[i+1].typ != tokPunct || tokens[i+1].value != "(" {
+			continue
+		}
+		j := i + 2
+		if j >= len(tokens) {
+			continue
+		}
+		url := c.tokenArgURL(tokens[j])
+		if !urlArgShape(url) {
+			continue
+		}
+		body := ""
+		if bodyCarryingMethods[method] && j+2 < len(tokens) && tokens[j+1].typ == tokPunct && tokens[j+1].value == "," {
+			switch v := tokens[j+2]; {
+			case v.typ == tokString || v.typ == tokTemplate:
+				if s := strings.TrimSpace(v.value); !urlArgShape(s) {
+					body = s
+				}
+			case v.typ == tokPunct && (v.value == "{" || v.value == "["):
+				if end := matchOpenLiteral(tokens, j+2); end > j+2 {
+					body = sliceSource(jsContent, tokens[j+2].pos, tokenEndRune(tokens, end))
+				}
+			}
+		}
+		c.addObs(url, method, nil, body)
+	}
+}
+
+// matchOpenLiteral scans forward from a balanced open token ({ or [), skipping
+// string/template/regexp tokens, and returns the index of the matching close.
+func matchOpenLiteral(tokens []token, start int) int {
+	if start >= len(tokens) {
+		return -1
+	}
+	open, close := "{", "}"
+	if tokens[start].value == "[" {
+		open, close = "[", "]"
+	}
+	depth := 1
+	for i := start + 1; i < len(tokens); i++ {
+		t := tokens[i]
+		if t.typ == tokString || t.typ == tokTemplate || t.typ == tokRegexp {
+			continue
+		}
+		if t.typ != tokPunct {
+			continue
+		}
+		switch t.value {
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// tokenEndRune returns the rune offset just past token i.
+func tokenEndRune(tokens []token, i int) int {
+	if i < 0 || i >= len(tokens) {
+		return 0
+	}
+	return tokens[i].pos + len([]rune(tokens[i].value))
+}
+
+// sliceSource extracts the raw source text between two rune offsets.
+func sliceSource(jsContent string, start, end int) string {
+	if jsContent == "" || end <= start {
+		return ""
+	}
+	runes := []rune(jsContent)
+	if start < 0 || end > len(runes) {
+		return ""
+	}
+	return strings.TrimSpace(string(runes[start:end]))
+}
+
+// tokenArgURL extracts an endpoint reference from a string or template token
+// argument. Template interpolations are rendered as {var}/{…} placeholders,
+// matching the convention used by the AST analysis.
+func (c *context) tokenArgURL(t token) string {
+	switch t.typ {
+	case tokString:
+		return strings.TrimSpace(t.value)
+	case tokTemplate:
+		parts := strings.Split(t.value, "\x00")
+		if len(t.interps) == 0 {
+			return strings.TrimSpace(strings.Join(parts, ""))
+		}
+		var b strings.Builder
+		n := len(t.interps) + 1
+		if len(parts) > n {
+			n = len(parts)
+		}
+		for i := 0; i < n; i++ {
+			if i > 0 && i-1 < len(t.interps) {
+				src := t.interps[i-1]
+				if strings.ContainsAny(src, " ()+*/&|?:,<>={}!\"'`;\\") {
+					b.WriteString("{…}")
+				} else {
+					b.WriteString("{" + src + "}")
+				}
+			}
+			if i < len(parts) {
+				b.WriteString(parts[i])
+			}
+		}
+		return strings.TrimSpace(b.String())
+	}
+	return ""
+}
+
 type context struct {
 	sourceURL string
 	fullInfo  bool
 	vars      map[string]string
 	props     map[string]map[string]string
+	varInits  map[string]expr
 	links     []linker.Link
 	seen      map[string]bool
+	obs       []contract.Observation
+	obsSeen   map[string]bool
 }
 
 func newContext(sourceURL string, fullInfo bool) *context {
@@ -89,7 +267,9 @@ func newContext(sourceURL string, fullInfo bool) *context {
 		fullInfo:  fullInfo,
 		vars:      map[string]string{},
 		props:     map[string]map[string]string{},
+		varInits:  map[string]expr{},
 		seen:      map[string]bool{},
+		obsSeen:   map[string]bool{},
 	}
 }
 
@@ -124,6 +304,215 @@ func (c *context) addLink(href, tag, matchSource, method string) {
 		}}
 	}
 	c.links = append(c.links, link)
+}
+
+// maxObs caps how many request observations one script may contribute so the
+// contract inference stays bounded on huge minified bundles.
+const maxObs = 4096
+
+// addObs feeds a captured request (method, headers, body) into the contract
+// observation pool, resolved against the script's source URL.
+func (c *context) addObs(rawURL, method string, headers []contract.NameValue, body string) {
+	if len(c.obs) >= maxObs {
+		return
+	}
+	u := resolveEndpoint(strings.TrimSpace(rawURL), c.sourceURL)
+	if u == "" {
+		return
+	}
+	key := strings.ToUpper(method) + "|" + u + "|" + body
+	for _, h := range headers {
+		key += "|" + h.Name + ":" + h.Value
+	}
+	if c.obsSeen[key] {
+		return
+	}
+	c.obsSeen[key] = true
+	c.obs = append(c.obs, contract.Observation{
+		URL:     u,
+		Method:  stringOr(method, "GET"),
+		Headers: headers,
+		Body:    body,
+	})
+}
+
+func stringOr(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}
+
+// initConfig captures the shape of a fetch/Request init object literal.
+type initConfig struct {
+	method  string
+	body    string
+	headers []contract.NameValue
+}
+
+// parseInit extracts method/body/headers from a fetch init expression (a
+// direct object literal or a var holding one).
+func (c *context) parseInit(e expr) initConfig {
+	var cfg initConfig
+	if id, ok := e.(*identExpr); ok {
+		if o2, ok := c.varInits[id.name]; ok {
+			if oe, ok := o2.(*objectExpr); ok {
+				e = oe
+			}
+		}
+	}
+	oe, ok := e.(*objectExpr)
+	if !ok {
+		return cfg
+	}
+	for _, p := range oe.properties {
+		switch strings.ToLower(p.key) {
+		case "method", "type":
+			cfg.method = c.evalExpr(p.value)
+		case "body", "data":
+			cfg.body = c.bodyExpr(p.value)
+		case "headers":
+			cfg.headers = c.headersExpr(p.value)
+		}
+	}
+	return cfg
+}
+
+// bodyExpr renders a request-body expression: object literals compile to JSON,
+// strings pass through, unknown/ident/dynamic values collapse to null so the
+// format analysis still sees a placeholder.
+func (c *context) bodyExpr(e expr) string {
+	if e == nil {
+		return ""
+	}
+	if v, ok := c.objValue(e); ok {
+		switch v := v.(type) {
+		case string:
+			s := strings.TrimSpace(v)
+			if s == "" {
+				return "null"
+			}
+			return s
+		case map[string]any, []any:
+			b, err := json.Marshal(v)
+			if err == nil {
+				return string(b)
+			}
+		}
+	}
+	if s := strings.TrimSpace(c.evalExpr(e)); s != "" {
+		return s
+	}
+	return "null"
+}
+
+// headersExpr converts a headers value (object literal or recorded props) into
+// ordered assignments.
+func (c *context) headersExpr(e expr) []contract.NameValue {
+	var out []contract.NameValue
+	switch e := e.(type) {
+	case *objectExpr:
+		for _, p := range e.properties {
+			v := c.evalExpr(p.value)
+			out = append(out, contract.NameValue{Name: p.key, Value: v})
+		}
+	case *identExpr:
+		if props, ok := c.props[e.name]; ok {
+			for k, v := range props {
+				out = append(out, contract.NameValue{Name: k, Value: v})
+			}
+		}
+	}
+	return out
+}
+
+// objValue converts a syntactically known expression into a JSON-able Go
+// value. Dynamic values (idents, calls, member lookups) resolve through the
+// tracked var/string table; anything unresolvable fails so callers can fall
+// back to a literal.
+func (c *context) objValue(e expr) (any, bool) {
+	switch e := e.(type) {
+	case *stringExpr:
+		return e.value, true
+	case *numberExpr:
+		if i, err := strconv.ParseInt(e.value, 10, 64); err == nil {
+			return i, true
+		}
+		if f, err := strconv.ParseFloat(e.value, 64); err == nil {
+			return f, true
+		}
+		return nil, false
+	case *boolExpr:
+		return e.value, true
+	case *nullExpr:
+		return nil, true
+	case *arrayExpr:
+		arr := make([]any, 0, len(e.elements))
+		for _, el := range e.elements {
+			v, ok := c.objValue(el)
+			if !ok {
+				v = nil
+			}
+			arr = append(arr, v)
+		}
+		return arr, true
+	case *objectExpr:
+		m := make(map[string]any, len(e.properties))
+		for _, p := range e.properties {
+			v, ok := c.objValue(p.value)
+			if !ok {
+				v = nil
+			}
+			m[p.key] = v
+		}
+		return m, true
+	case *binaryExpr:
+		if e.op == "+" {
+			l, lk := c.objValue(e.left)
+			r, rk := c.objValue(e.right)
+			if lk && rk {
+				return fmt.Sprint(l) + fmt.Sprint(r), true
+			}
+		}
+	case *templateExpr:
+		var b strings.Builder
+		for _, p := range e.parts {
+			v, ok := c.objValue(p)
+			if !ok {
+				return nil, false
+			}
+			b.WriteString(fmt.Sprint(v))
+		}
+		return b.String(), true
+	case *identExpr:
+		if v, ok := c.vars[e.name]; ok {
+			return v, true
+		}
+	case *callExpr:
+		// JSON.stringify({...})
+		if me, ok := e.callee.(*memberExpr); ok && me.property == "stringify" {
+			if len(e.args) > 0 {
+				if v, ok := c.objValue(e.args[0]); ok {
+					b, err := json.Marshal(v)
+					if err == nil {
+						return string(b), true
+					}
+				}
+			}
+		}
+		if s := c.evalCall(e); s != "" {
+			return s, true
+		}
+	case *memberExpr:
+		if s := c.evalMember(e); s != "" {
+			return s, true
+		}
+	case *unaryExpr:
+		if s := c.evalExpr(e); s != "" {
+			return s, true
+		}
+	}
+	return nil, false
 }
 
 func (c *context) analyze(stmts []stmt) {
@@ -170,6 +559,10 @@ func (c *context) analyzeVarDecl(d *varDecl) {
 	val := c.evalExpr(d.init)
 	if val != "" {
 		c.vars[d.name] = val
+	}
+	switch d.init.(type) {
+	case *objectExpr, *arrayExpr, *callExpr:
+		c.varInits[d.name] = d.init
 	}
 	if oe, ok := d.init.(*objectExpr); ok {
 		props := make(map[string]string)
@@ -409,8 +802,20 @@ func (c *context) resolveCall(ce *callExpr) (match callMatch, objName, methodNam
 		}
 		if name == "Request" || name == "request" {
 			if len(ce.args) > 0 {
-				return callNewRequest, "Request", "", "GET"
+				// request({url, method, data}) is the superagent/axios-style
+				// options form; new Request('/path') is the fetch-style form.
+				if _, ok := ce.args[0].(*objectExpr); ok {
+					return callConfig, name, name, "GET"
+				}
+				if id, ok := ce.args[0].(*identExpr); ok {
+					if o2, ok := c.varInits[id.name]; ok {
+						if _, ok := o2.(*objectExpr); ok {
+							return callConfig, name, name, "GET"
+						}
+					}
+				}
 			}
+			return callNewRequest, "Request", "", "GET"
 		}
 
 	case *memberExpr:
@@ -491,21 +896,32 @@ func (c *context) resolveCall(ce *callExpr) (match callMatch, objName, methodNam
 func (c *context) analyzeConfigObj(oe *objectExpr) {
 	urlVal := ""
 	method := ""
+	var body string
+	var headers []contract.NameValue
 	for _, prop := range oe.properties {
-		if configPropKeys[prop.key] {
+		switch {
+		case configPropKeys[prop.key]:
 			urlVal = c.evalExpr(prop.value)
 			if urlVal == "" {
 				if id, ok := prop.value.(*identExpr); ok {
 					urlVal = c.vars[id.name]
 				}
 			}
-		}
-		if prop.key == "method" || prop.key == "type" {
+		case prop.key == "method" || prop.key == "type":
 			method = c.evalExpr(prop.value)
+		case prop.key == "body" || prop.key == "data":
+			body = c.bodyExpr(prop.value)
+		case prop.key == "headers":
+			headers = c.headersExpr(prop.value)
 		}
 	}
 	if urlVal != "" {
 		c.addLink(urlVal, "js-api", "config", method)
+		m := strings.ToUpper(strings.TrimSpace(method))
+		if m == "" {
+			m = "GET"
+		}
+		c.addObs(urlVal, m, headers, body)
 	}
 }
 
@@ -526,6 +942,17 @@ func (c *context) evalExpr(e expr) string {
 			parts = append(parts, s)
 		}
 		return strings.Join(parts, "")
+	case *interpExpr:
+		if v, ok := c.vars[e.src]; ok {
+			return v
+		}
+		if strings.ContainsAny(e.src, " \t()[]{}+*/&|?:,<>") {
+			return ""
+		}
+		if inner := dottedExpr(e.src); inner != nil {
+			return c.evalExpr(inner)
+		}
+		return ""
 	case *identExpr:
 		if val, ok := c.vars[e.name]; ok {
 			return val
@@ -579,6 +1006,102 @@ func (c *context) evalExpr(e expr) string {
 		return ""
 	case *nullExpr:
 		return ""
+	}
+	return ""
+}
+
+// dottedExpr builds an expression from a simple dotted path ("cfg.baseUrl")
+// so template interpolations such as ${cfg.baseUrl} can be resolved through
+// the tracked variable/property tables. Returns nil for anything more complex.
+func dottedExpr(s string) expr {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.Contains(s, " ") {
+		return nil
+	}
+	segments := strings.Split(s, ".")
+	if len(segments) == 0 || segments[0] == "" {
+		return nil
+	}
+	var e expr
+	for i, seg := range segments {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			return nil
+		}
+		if i == 0 {
+			e = &identExpr{name: seg}
+		} else {
+			e = &memberExpr{object: e, property: seg}
+		}
+	}
+	return e
+}
+
+// placeholder renders an unresolvable sub-expression as a readable path
+// placeholder ("{id}") so a dynamic endpoint shape is not lost. Bare idents
+// used as whole arguments are deliberately excluded from this treatment by
+// resolveURLArg — a bare unknown var is likely a base/abstraction, not a path.
+func (c *context) placeholder(e expr) string {
+	switch e := e.(type) {
+	case *interpExpr:
+		if strings.ContainsAny(e.src, " ()+*/&|?:,<>={}!\"'`;\\") {
+			return "{…}"
+		}
+		return "{" + e.src + "}"
+	case *identExpr:
+		return "{" + e.name + "}"
+	case *memberExpr:
+		return "{" + exprPath(e) + "}"
+	}
+	return ""
+}
+
+// resolveURLArg returns the best-effort literal for an endpoint argument.
+// Fully-resolvable expressions evaluate normally; otherwise static fragments
+// are kept and unresolvable interpolations become "{var}" placeholders
+// (e.g. "/api/admin/recorders/{n}/sync"). Unknown stand-alone idents yield ""
+// so opaque bases like this.ajaxUrl never surface as junk links.
+func (c *context) resolveURLArg(e expr) string {
+	if s := c.evalExpr(e); s != "" {
+		return s
+	}
+	switch e := e.(type) {
+	case *templateExpr:
+		var b strings.Builder
+		for _, p := range e.parts {
+			if se, ok := p.(*stringExpr); ok {
+				b.WriteString(se.value)
+				continue
+			}
+			if s := c.evalExpr(p); s != "" {
+				b.WriteString(s)
+			} else if ph := c.placeholder(p); ph != "" {
+				b.WriteString(ph)
+			} else {
+				return ""
+			}
+		}
+		return b.String()
+	case *binaryExpr:
+		if e.op == "+" {
+			left := c.evalExpr(e.left)
+			if left != "" {
+				right := c.evalExpr(e.right)
+				if right != "" {
+					return left + right
+				}
+				// static prefix + dynamic tail: keep the prefix
+				return left
+			}
+			right := c.evalExpr(e.right)
+			if right != "" {
+				if strings.HasPrefix(right, "/") {
+					if ph := c.placeholder(e.left); ph != "" {
+						return ph + right
+					}
+				}
+			}
+		}
 	}
 	return ""
 }
@@ -689,9 +1212,11 @@ const (
 )
 
 type token struct {
-	typ   tokenType
-	value string
-	pos   int
+	typ     tokenType
+	value   string
+	pos     int
+	parts   []string // tokTemplate: static segments ("" when the scan ended before the terminator)
+	interps []string // tokTemplate: raw interpolation sources, in order
 }
 
 func tokenize(src string) []token {
@@ -796,7 +1321,8 @@ func tokenize(src string) []token {
 
 		if ch == '`' {
 			j := i + 1
-			parts := []string{}
+			staticParts := []string{}
+			var interps []string
 			partStart := j
 			for j < len(runes) {
 				if runes[j] == '\\' {
@@ -805,9 +1331,10 @@ func tokenize(src string) []token {
 				}
 				if runes[j] == '$' && j+1 < len(runes) && runes[j+1] == '{' {
 					if partStart < j {
-						parts = append(parts, string(runes[partStart:j]))
+						staticParts = append(staticParts, string(runes[partStart:j]))
 					}
 					depth := 1
+					interpStart := j + 2
 					j += 2
 					for j < len(runes) && depth > 0 {
 						if runes[j] == '{' {
@@ -817,14 +1344,19 @@ func tokenize(src string) []token {
 						}
 						j++
 					}
+					interps = append(interps, string(runes[interpStart:j-1]))
 					partStart = j
 					continue
 				}
 				if runes[j] == '`' {
 					if partStart < j {
-						parts = append(parts, string(runes[partStart:j]))
+						staticParts = append(staticParts, string(runes[partStart:j]))
 					}
-					emit(tokTemplate, strings.Join(parts, "\x00"))
+					emit(tokTemplate, strings.Join(staticParts, "\x00"))
+					if len(interps) > 0 {
+						tokens[len(tokens)-1].parts = staticParts
+						tokens[len(tokens)-1].interps = interps
+					}
 					j++
 					break
 				}
@@ -1019,9 +1551,12 @@ func (p *parser) advance() token {
 }
 
 func (p *parser) expect(typ tokenType, value string) token {
-	t := p.advance()
+	t := p.peek()
 	if t.typ == tokEOF {
 		return t
+	}
+	if t.typ == typ && (value == "" || t.value == value) {
+		p.advance()
 	}
 	return t
 }
@@ -1139,19 +1674,39 @@ func (p *parser) parseStmt() stmt {
 	}
 }
 
-func (p *parser) parseVarDecl() *varDecl {
+func (p *parser) parseVarDecl() stmt {
 	t := p.advance()
 	kind := t.value
 
+	first := p.parseSingleDeclarator(kind)
+	if p.peek().typ != tokPunct || p.peek().value != "," {
+		p.skipSemicolons()
+		return first
+	}
+
+	list := []stmt{first}
+	for p.peek().typ == tokPunct && p.peek().value == "," {
+		p.advance()
+		list = append(list, p.parseSingleDeclarator(kind))
+	}
+	p.skipSemicolons()
+	return &blockStmt{stmts: list}
+}
+
+// parseSingleDeclarator parses one "name[ = init]" pair of a var/let/const
+// declaration. Destructuring and other exotic patterns fall back to consuming
+// a single token so parsing always makes progress.
+func (p *parser) parseSingleDeclarator(kind string) *varDecl {
 	nameTok := p.expect(tokIdent, "")
 	name := nameTok.value
-
-	p.expect(tokOp, "=")
-
-	init := p.parseExpr(0)
-
-	p.skipSemicolons()
-
+	if name == "" {
+		p.advance()
+	}
+	var init expr
+	if p.peek().typ == tokOp && p.peek().value == "=" {
+		p.advance()
+		init = p.parseExpr(0)
+	}
 	return &varDecl{name: name, init: init, kind: kind}
 }
 
@@ -1218,6 +1773,20 @@ func (p *parser) parseForStmt() *forStmt {
 		init = p.parseVarDecl()
 	} else {
 		init = p.parseExprStmt()
+	}
+
+	if p.peek().typ == tokOp && (p.peek().value == "in" || p.peek().value == "of") {
+		p.advance()
+		p.parseExpr(0)
+	} else {
+		p.parseExpr(0) // condition
+		if p.peek().typ == tokPunct && p.peek().value == ";" {
+			p.advance()
+		}
+		p.parseExpr(0) // update
+	}
+	if p.peek().typ == tokPunct && p.peek().value == ")" {
+		p.advance()
 	}
 
 	var body stmt
@@ -1352,12 +1921,33 @@ func (p *parser) parseExpr(minPrec int) expr {
 	case tokTemplate:
 		p.advance()
 		parts := strings.Split(t.value, "\x00")
-		if len(parts) == 1 {
-			left = &stringExpr{value: parts[0]}
+		if len(t.interps) == 0 {
+			if len(parts) == 1 {
+				left = &stringExpr{value: parts[0]}
+			} else {
+				var exprs []expr
+				for _, part := range parts {
+					exprs = append(exprs, &stringExpr{value: part})
+				}
+				left = &templateExpr{parts: exprs}
+			}
 		} else {
+			// Interpolations alternate with static segments:
+			// P0 ${I0} P1 ${I1} … Pk. The last static segment is dropped by the
+			// tokenizer when it is empty, so iterate over the maximum of the
+			// two lengths to keep every interpolation.
+			n := len(t.interps) + 1
+			if len(parts) > n {
+				n = len(parts)
+			}
 			var exprs []expr
-			for _, part := range parts {
-				exprs = append(exprs, &stringExpr{value: part})
+			for i := 0; i < n; i++ {
+				if i > 0 {
+					exprs = append(exprs, &interpExpr{src: t.interps[i-1]})
+				}
+				if i < len(parts) {
+					exprs = append(exprs, &stringExpr{value: parts[i]})
+				}
 			}
 			left = &templateExpr{parts: exprs}
 		}
@@ -1368,7 +1958,12 @@ func (p *parser) parseExpr(minPrec int) expr {
 
 	case tokIdent:
 		p.advance()
-		left = &identExpr{name: t.value}
+		if p.peek().typ == tokOp && p.peek().value == "=>" {
+			p.advance()
+			left = p.parseArrowBody()
+		} else {
+			left = &identExpr{name: t.value}
+		}
 
 	case tokOp:
 		if t.value == "!" || t.value == "~" || t.value == "+" || t.value == "-" || t.value == "typeof" || t.value == "void" || t.value == "delete" {
@@ -1398,6 +1993,22 @@ func (p *parser) parseExpr(minPrec int) expr {
 				args = p.parseArgs()
 			}
 			left = &newExpr{callee: callee, args: args}
+		case "async":
+			p.advance()
+			if p.peek().typ == tokPunct && p.peek().value == "(" && p.isArrowAhead() {
+				p.consumeArrowHeader()
+				left = p.parseArrowBody()
+			} else if p.peek().typ == tokIdent {
+				p.advance()
+				if p.peek().typ == tokOp && p.peek().value == "=>" {
+					p.advance()
+					left = p.parseArrowBody()
+				} else {
+					left = &identExpr{name: t.value}
+				}
+			} else {
+				left = &identExpr{name: t.value}
+			}
 		case "true":
 			p.advance()
 			left = &boolExpr{value: true}
@@ -1428,9 +2039,6 @@ func (p *parser) parseExpr(minPrec int) expr {
 			p.advance()
 			expr := p.parseExpr(precUnary)
 			left = &unaryExpr{op: t.value, expr: expr}
-		case "async":
-			p.advance()
-			left = &identExpr{name: "async"}
 		default:
 			p.advance()
 			left = &identExpr{name: t.value}
@@ -1439,9 +2047,14 @@ func (p *parser) parseExpr(minPrec int) expr {
 	case tokPunct:
 		if t.value == "(" {
 			p.advance()
-			expr := p.parseExpr(0)
-			p.expect(tokPunct, ")")
-			left = expr
+			if p.isArrowAhead() {
+				p.consumeArrowHeader()
+				left = p.parseArrowBody()
+			} else {
+				expr := p.parseExpr(0)
+				p.expect(tokPunct, ")")
+				left = expr
+			}
 		} else if t.value == "[" {
 			p.advance()
 			var elements []expr
@@ -1631,6 +2244,65 @@ func (p *parser) parseExpr(minPrec int) expr {
 	return left
 }
 
+// isArrowAhead reports whether the current position holds the start of an
+// arrow-function parameter list "(…)" whose matching ")" is directly followed
+// by "=>". It only scans tokens and never advances the parser.
+func (p *parser) isArrowAhead() bool {
+	depth := 1
+	for i := p.pos; i < len(p.tokens); i++ {
+		t := p.tokens[i]
+		if t.typ == tokPunct {
+			switch t.value {
+			case "(", "[", "{":
+				depth++
+			case ")", "]", "}":
+				depth--
+				if depth == 0 {
+					return i+1 < len(p.tokens) && p.tokens[i+1].typ == tokOp && p.tokens[i+1].value == "=>"
+				}
+			}
+		}
+		if t.typ == tokEOF {
+			return false
+		}
+	}
+	return false
+}
+
+// consumeArrowHeader skips the parameter list "(…)" and the following "=>" of
+// an arrow function. The caller guarantees isArrowAhead() was true.
+func (p *parser) consumeArrowHeader() {
+	if p.peek().typ == tokPunct && p.peek().value == "(" {
+		p.advance()
+	}
+	depth := 1
+	for depth > 0 {
+		t := p.peek()
+		if t.typ == tokEOF {
+			return
+		}
+		if t.typ == tokPunct {
+			switch t.value {
+			case "(", "[", "{":
+				depth++
+			case ")", "]", "}":
+				depth--
+			}
+		}
+		p.advance()
+	}
+	p.advance() // "=>"
+}
+
+// parseArrowBody parses the body of an arrow function (block or expression).
+func (p *parser) parseArrowBody() *funcExpr {
+	if p.peek().typ == tokPunct && p.peek().value == "{" {
+		return &funcExpr{body: p.parseBlockStmt()}
+	}
+	e := p.parseExpr(0)
+	return &funcExpr{body: &blockStmt{stmts: []stmt{&exprStmt{expr: e}}}}
+}
+
 func (p *parser) isObjectLiteral() bool {
 	save := p.pos
 	defer func() { p.pos = save }()
@@ -1809,6 +2481,15 @@ type templateExpr struct {
 }
 
 func (*templateExpr) exprNode() {}
+
+// interpExpr is a single template-literal interpolation. The raw source text
+// is kept verbatim so dynamic endpoint shapes survive even when the value
+// cannot be resolved (evalExpr) and fall back to a {placeholder} form.
+type interpExpr struct {
+	src string
+}
+
+func (*interpExpr) exprNode() {}
 
 type numberExpr struct {
 	value string
@@ -2024,6 +2705,19 @@ var apiEndpointSignals = []string{
 	"/socket.io", "/sse/", "/oauth", "/token", "/graphiql",
 }
 
+// placeholderStripRE removes dynamic {…} path placeholders so the API-shape
+// test can evaluate a template endpoint like /api/admin/cameras/{e}/snapshot.
+var placeholderStripRE = regexp.MustCompile(`\{[^}]*\}`)
+
+// apiEndpointShape reports whether a resolved call target (which may still
+// carry {var} placeholders for dynamic segments) carries an API signal.
+func apiEndpointShape(s string) bool {
+	if strings.Contains(s, "{") {
+		return looksLikeAPIEndpoint(placeholderStripRE.ReplaceAllString(s, ""))
+	}
+	return looksLikeAPIEndpoint(s)
+}
+
 // looksLikeAPIEndpoint applies a strict test suitable for the harvesting
 // fallback, where we have no call-site context. It requires the string to be
 // path- or URL-shaped, not a static asset, and to carry an explicit API signal
@@ -2141,31 +2835,105 @@ func (c *context) resolveNewExpr(ne *newExpr) (match callMatch, objName, methodN
 func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, httpMethod string) {
 	switch match {
 	case callDirect, callNewRequest:
-		var url string
 		if len(args) > 0 {
-			url = c.evalExpr(args[0])
-			if url == "" {
-				if id, ok := args[0].(*identExpr); ok {
-					url = c.vars[id.name]
+			// axios({url, method, data}) / request({url, ...}): the options
+			// object form is a config, not a URL.
+			if oe, ok := args[0].(*objectExpr); ok {
+				c.analyzeConfigObj(oe)
+				return
+			}
+			if id, ok := args[0].(*identExpr); ok {
+				if o2, ok := c.varInits[id.name]; ok {
+					if oe, ok := o2.(*objectExpr); ok {
+						c.analyzeConfigObj(oe)
+						return
+					}
 				}
 			}
 		}
+		var url string
+		if len(args) > 0 {
+			url = c.resolveURLArg(args[0])
+		}
 		if url != "" {
 			c.addLink(url, "js-api", objName+"."+methodName, httpMethod)
+		}
+		// fetch(url, init) / new Request(url, init): capture method/body/headers.
+		method := httpMethod
+		var body string
+		var headers []contract.NameValue
+		if len(args) > 1 {
+			cfg := c.parseInit(args[1])
+			if cfg.method != "" {
+				method = cfg.method
+			}
+			body, headers = cfg.body, cfg.headers
+		}
+		if url != "" {
+			c.addObs(url, method, headers, body)
 		}
 
 	case callMethod:
 		var url string
 		if len(args) > 0 {
-			url = c.evalExpr(args[0])
-			if url == "" {
-				if id, ok := args[0].(*identExpr); ok {
-					url = c.vars[id.name]
+			url = c.resolveURLArg(args[0])
+		}
+		if url != "" {
+			// Routers and non-HTTP libs also expose .get('/path'); for GET
+			// calls require an explicit API signal so page routes do not
+			// masquerade as endpoints. Other verbs are call-specific enough.
+			if strings.EqualFold(methodName, "get") && !apiEndpointShape(url) {
+				break
+			}
+			c.addLink(url, "js-api", objName+"."+methodName, httpMethod)
+		}
+		// Bitrix RPC dispatch: BX.ajax.runAction('Namespace.Method', {data:{...}})
+		// POSTs to /bitrix/services/main/ajax.php with the action in the body.
+		if objName == "BX" && strings.HasPrefix(methodName, "ajax.runAction") {
+			action := ""
+			if len(args) > 0 {
+				action = strings.TrimSpace(c.evalExpr(args[0]))
+			}
+			var payload map[string]any
+			if len(args) > 1 {
+				cfg := c.parseInit(args[1])
+				if cfg.body != "" {
+					var m map[string]any
+					if json.Unmarshal([]byte(cfg.body), &m) == nil {
+						payload = m
+					}
 				}
+			}
+			if payload == nil {
+				payload = map[string]any{}
+			}
+			payload["action"] = stringOr(action, "<action>")
+			payload["mode"] = "ajax"
+			b, _ := json.Marshal(payload)
+			c.addObs(resolveEndpoint("/bitrix/services/main/ajax.php", c.sourceURL),
+				"POST", []contract.NameValue{{Name: "x-requested-with", Value: "XMLHttpRequest"}}, string(b))
+			return
+		}
+		// obj.get/post/... First arg is the endpoint; a second object argument
+		// may carry method/headers/body (axios-style), otherwise args[1] is the
+		// payload for POST/PUT/PATCH.
+		m := strings.ToUpper(stringOr(httpMethod, "GET"))
+		var headers []contract.NameValue
+		var body string
+		if len(args) > 1 {
+			cfg := c.parseInit(args[1])
+			headers = cfg.headers
+			if cfg.method != "" {
+				m = cfg.method
+			}
+			if cfg.body != "" {
+				body = cfg.body
+			} else if m == "POST" || m == "PUT" || m == "PATCH" {
+				body = c.bodyExpr(args[1])
 			}
 		}
 		if url != "" {
-			c.addLink(url, "js-api", objName+"."+methodName, httpMethod)
+			c.addObs(url, m, headers, body)
 		}
 
 	case callConfig:
@@ -2176,24 +2944,25 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 				if val, exists := c.vars[id.name]; exists && looksLikeURL(val) {
 					c.addLink(val, "js-api", objName+"."+methodName, "")
 				}
+				if o2, ok := c.varInits[id.name]; ok {
+					if oe, ok := o2.(*objectExpr); ok {
+						c.analyzeConfigObj(oe)
+					}
+				}
 			}
 		}
 
 	case callXHROpen:
 		var url string
 		if len(args) > 1 {
-			url = c.evalExpr(args[1])
-			if url == "" {
-				if id, ok := args[1].(*identExpr); ok {
-					url = c.vars[id.name]
-				}
-			}
+			url = c.resolveURLArg(args[1])
 			if httpMethod == "" && len(args) > 0 {
 				httpMethod = c.evalExpr(args[0])
 			}
 		}
 		if url != "" {
 			c.addLink(url, "js-api", "XHR.open", httpMethod)
+			c.addObs(url, httpMethod, nil, "")
 		}
 	}
 }

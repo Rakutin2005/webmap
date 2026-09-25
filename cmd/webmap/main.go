@@ -15,6 +15,7 @@ import (
 	"apimap/internal/categorizer"
 	"apimap/internal/color"
 	"apimap/internal/config"
+	"apimap/internal/contract"
 	"apimap/internal/emulator"
 	"apimap/internal/fetcher"
 	"apimap/internal/graph"
@@ -23,11 +24,122 @@ import (
 	"apimap/internal/markdown"
 	"apimap/internal/patterns"
 	"apimap/internal/progress"
+	"apimap/internal/urlgroup"
 )
 
 var activePatterns *patterns.PatternSet
 
 var lastEmuSummary *emulator.Summary
+
+// activeGroups holds the URL patterns confirmed over the whole scan. It feeds
+// both the "URL Patterns" output section and the API-contract canonicalization
+// (concrete URLs matching a pattern are folded into the pattern endpoint).
+var activeGroups []urlgroup.Group
+
+// obsPool accumulates request observations from static JS analysis and browser
+// emulation across the whole scan; contract.Infer turns it into endpoint
+// contracts at the end.
+var (
+	obsMu   sync.Mutex
+	obsPool []contract.Observation
+)
+
+// poolObs merges freshly collected observations into the global pool.
+func poolObs(_ bool, obs []contract.Observation) {
+	obsMu.Lock()
+	defer obsMu.Unlock()
+	obsPool = append(obsPool, obs...)
+}
+
+// fragMu guards the discovered runtime search-parameter names. These come from
+// URLSearchParams-style .set()/.append() builders in raw bundles and reveal
+// which query keys dynamic endpoints are assembled with.
+var (
+	fragMu       sync.Mutex
+	fragParams   []string
+	fragParamSet map[string]bool
+)
+
+// poolFragments collects runtime query-parameter names so a single
+// "Dynamic query params" block can be printed at the end of the scan.
+func poolFragments(params []string) {
+	if len(params) == 0 {
+		return
+	}
+	fragMu.Lock()
+	defer fragMu.Unlock()
+	if fragParamSet == nil {
+		fragParamSet = make(map[string]bool)
+	}
+	for _, p := range params {
+		if !fragParamSet[p] {
+			fragParamSet[p] = true
+			fragParams = append(fragParams, p)
+		}
+	}
+}
+
+// renderFragmentFindings prints the runtime endpoint-formation findings that
+// raw-bundle analysis recovered (dynamic URL templates and query-param names).
+func renderFragmentFindings(cfg *config.Config) {
+	fragMu.Lock()
+	params := append([]string(nil), fragParams...)
+	fragMu.Unlock()
+	if len(params) == 0 {
+		return
+	}
+	sort.Strings(params)
+	if cfg.Color {
+		fmt.Println(color.Colorize(color.Bold, "\n=== Dynamic query params ==="))
+	} else {
+		fmt.Println("\n=== Dynamic query params ===")
+	}
+	for _, p := range params {
+		fmt.Printf("  %s\n", p)
+	}
+}
+
+// renderContractSection prints the inferred API contract section.
+func renderContractSection(cfg *config.Config) {
+	obsMu.Lock()
+	obs := append([]contract.Observation(nil), obsPool...)
+	obsMu.Unlock()
+	if len(obs) == 0 {
+		return
+	}
+	obs = canonizeObservations(obs)
+	eps := contract.Infer(obs)
+	if len(eps) == 0 {
+		return
+	}
+	if cfg.Color {
+		fmt.Println(color.Colorize(color.Bold, "\n=== API Contracts ==="))
+	} else {
+		fmt.Println("\n=== API Contracts ===")
+	}
+	if cfg.Color {
+		fmt.Print(contract.RenderColored(eps, cfg.APIContractRaw))
+	} else {
+		fmt.Print(contract.Render(eps, cfg.APIContractRaw))
+	}
+}
+
+// canonizeObservations rewrites observation URLs that match a confirmed URL
+// pattern to the pattern itself, so concrete instances (/complex/9223/contacts
+// and /complex/9224/contacts) collapse into one contract endpoint
+// (/complex/{id}/contacts).
+func canonizeObservations(obs []contract.Observation) []contract.Observation {
+	if len(activeGroups) == 0 {
+		return obs
+	}
+	out := append([]contract.Observation(nil), obs...)
+	for i := range out {
+		if p := urlgroup.MatchURL(out[i].URL, activeGroups); p != "" {
+			out[i].URL = p
+		}
+	}
+	return out
+}
 
 // Emulation resource controls, initialized from config when -emulate is set.
 var (
@@ -45,9 +157,10 @@ func initEmulationLimits(cfg *config.Config) {
 	}
 	emuSem = make(chan struct{}, workers)
 	emuLimits = emulator.Limits{
-		Timeout: time.Duration(cfg.EmulateTimeout) * time.Millisecond,
-		MaxJS:   cfg.EmulateMaxJS * 1024,
-		MaxJobs: cfg.EmulateMaxJobs,
+		Timeout:      time.Duration(cfg.EmulateTimeout) * time.Millisecond,
+		MaxJS:        cfg.EmulateMaxJS * 1024,
+		MaxJobs:      cfg.EmulateMaxJobs,
+		MaxAbandoned: cfg.EmulateMaxLeaks,
 	}
 }
 
@@ -121,9 +234,14 @@ func main() {
 		enrichLinks(allLinks, f)
 		if cfg.AnalyzeJS {
 			if isJSURL(result.URL) {
-				jsLinks := jsanalyzer.Parse(result.Body, result.URL, cfg.APIFull)
+				jsLinks, jsObs := jsanalyzer.Parse(result.Body, result.URL, cfg.APIFull)
 				enrichLinks(jsLinks, f)
+				fragLinks, fragParams := linker.AnalyzeJS(result.Body, result.URL)
+				enrichLinks(fragLinks, f)
 				allLinks = append(allLinks, jsLinks...)
+				allLinks = append(allLinks, fragLinks...)
+				poolObs(true, jsObs)
+				poolFragments(fragParams)
 			}
 			ct := result.Headers.Get("Content-Type")
 			if strings.Contains(ct, "html") || strings.Contains(ct, "text/html") {
@@ -132,9 +250,14 @@ func main() {
 					combined += inline + "\n"
 				}
 				if combined != "" {
-					jsLinks := jsanalyzer.Parse(combined, result.URL, cfg.APIFull)
+					jsLinks, jsObs := jsanalyzer.Parse(combined, result.URL, cfg.APIFull)
 					enrichLinks(jsLinks, f)
+					fragLinks, fragParams := linker.AnalyzeJS(combined, result.URL)
+					enrichLinks(fragLinks, f)
 					allLinks = append(allLinks, jsLinks...)
+					allLinks = append(allLinks, fragLinks...)
+					poolObs(true, jsObs)
+					poolFragments(fragParams)
 				}
 			}
 		}
@@ -147,7 +270,12 @@ func main() {
 		displayLinks = groupParamLinks(displayLinks)
 		sortLinks(displayLinks)
 		displayLinks = mergeAPIDetails(displayLinks)
-		printResults(allLinks, displayLinks, cfg)
+		displayLinks = applyGrouping(allLinks, displayLinks, cfg)
+		printResults(allLinks, displayLinks, activeGroups, cfg)
+		if cfg.APIContract {
+			renderContractSection(cfg)
+		}
+		renderFragmentFindings(cfg)
 
 		p.IncrementRequest()
 		p.Increment()
@@ -184,11 +312,16 @@ func main() {
 	displayLinks = groupParamLinks(displayLinks)
 	sortLinks(displayLinks)
 	displayLinks = mergeAPIDetails(displayLinks)
+	displayLinks = applyGrouping(allLinks, displayLinks, cfg)
 
 	close(progressDone)
 	p.Finish()
 
-	printResults(allLinks, displayLinks, cfg)
+	printResults(allLinks, displayLinks, activeGroups, cfg)
+	if cfg.APIContract {
+		renderContractSection(cfg)
+	}
+	renderFragmentFindings(cfg)
 
 	if cfg.Markdown || cfg.Graphical {
 		g := graph.New(allLinks, cfg.URL)
@@ -296,6 +429,137 @@ func formatParamVariants(variants []linker.ParamVariant) string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, "; ")
+}
+
+// applyGrouping folds discovered URLs into patterns, drops pattern members
+// from the displayed link list, and records the groups for the pattern and
+// API-contract output. Grouping is skipped when disabled via -nogroup.
+func applyGrouping(allLinks, displayLinks []linker.Link, cfg *config.Config) []linker.Link {
+	if cfg.NoGroup {
+		return displayLinks
+	}
+	activeGroups = urlgroup.BuildLinks(allLinks, cfg.GroupCount)
+	return urlgroup.WithoutMembers(displayLinks, activeGroups)
+}
+
+// renderURLPatternsPlain builds the "URL Patterns" section: each line is one
+// annotation cluster "(type: name)" followed by the comma-joined patterns that
+// share it, with instance counts and the merged variable ranges.
+func renderURLPatternsPlain(groups []urlgroup.Group) string {
+	if len(groups) == 0 {
+		return ""
+	}
+	clusters := map[string][]urlgroup.Group{}
+	var order []string
+	for _, g := range groups {
+		ann := g.Annotation()
+		if _, ok := clusters[ann]; !ok {
+			order = append(order, ann)
+		}
+		clusters[ann] = append(clusters[ann], g)
+	}
+	sort.Strings(order)
+
+	var b strings.Builder
+	b.WriteString("\n=== URL Patterns ===\n")
+	for _, ann := range order {
+		gs := clusters[ann]
+		var parts []string
+		for _, g := range gs {
+			parts = append(parts, fmt.Sprintf("%s (%d)", g.Pattern, g.Count))
+		}
+		line := "  " + ann + " " + strings.Join(parts, ", ")
+		if ranges := urlgroup.ClusterRanges(gs); len(ranges) > 0 {
+			line += "  [" + strings.Join(ranges, ", ") + "]"
+		}
+		b.WriteString(wrapLine(line, 120) + "\n")
+	}
+	return b.String()
+}
+
+// kindColor maps a grouping kind to its output color.
+func kindColor(kind string) color.Code {
+	switch kind {
+	case "int":
+		return color.Green
+	case "string":
+		return color.Yellow
+	case "uuid":
+		return color.Purple
+	case "hash":
+		return color.Cyan
+	case "base64":
+		return color.DarkPurple
+	default:
+		return color.White
+	}
+}
+
+// renderURLPatternsColored is the colorized variant of renderURLPatternsPlain.
+func renderURLPatternsColored(groups []urlgroup.Group) string {
+	if len(groups) == 0 {
+		return ""
+	}
+	clusters := map[string][]urlgroup.Group{}
+	var order []string
+	for _, g := range groups {
+		ann := g.Annotation()
+		if _, ok := clusters[ann]; !ok {
+			order = append(order, ann)
+		}
+		clusters[ann] = append(clusters[ann], g)
+	}
+	sort.Strings(order)
+
+	var b strings.Builder
+	b.WriteString("\n" + color.Colorize(color.Bold, "=== URL Patterns ===") + "\n")
+	for _, ann := range order {
+		gs := clusters[ann]
+		var parts []string
+		for _, g := range gs {
+			parts = append(parts, color.Colorize(color.White, g.Pattern)+" "+color.Colorizef(color.Dim, "(%d)", g.Count))
+		}
+		var kp []string
+		for i, v := range gs[0].Vars {
+			kind := v.Kind
+			if kind == "" {
+				kind = "string"
+			}
+			kp = append(kp, color.Colorize(kindColor(kind), kind)+color.Colorize(color.Bold, ": "+urlgroup.VarLabel(i)))
+		}
+		coloredAnn := "(" + strings.Join(kp, ", ") + ")"
+		line := "  " + coloredAnn + " " + strings.Join(parts, ", ")
+		if ranges := urlgroup.ClusterRanges(gs); len(ranges) > 0 {
+			var rp []string
+			for _, r := range ranges {
+				rp = append(rp, color.Colorize(color.Dim, r))
+			}
+			line += "  [" + strings.Join(rp, ", ") + "]"
+		}
+		b.WriteString(wrapLine(line, 120) + "\n")
+	}
+	return b.String()
+}
+
+// wrapLine soft-wraps a long line at word boundaries close to the width limit.
+func wrapLine(s string, width int) string {
+	if len(s) <= width {
+		return s
+	}
+	var b strings.Builder
+	cur := 0
+	for _, word := range strings.Split(s, " ") {
+		if cur > 0 && cur+len(word)+1 > width && cur < width {
+			b.WriteString("\n     ")
+			cur = 5
+		} else if cur > 0 {
+			b.WriteString(" ")
+			cur++
+		}
+		b.WriteString(word)
+		cur += len(word)
+	}
+	return b.String()
 }
 
 func groupParamLinks(links []linker.Link) []linker.Link {
@@ -553,6 +817,13 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 	allLinks := []linker.Link{}
 	pendingURLs := []pageTask{{cfg.URL, 0}}
 
+	// Detector confirms URL patterns incrementally across crawl batches; URLs
+	// absorbed by a confirmed pattern are dropped from the crawl queue.
+	var detector *urlgroup.Detector
+	if !cfg.NoGroup {
+		detector = urlgroup.NewDetector(cfg.GroupCount)
+	}
+
 	totalRequests := 0
 
 	for i := 0; i < maxWorkers; i++ {
@@ -570,9 +841,14 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 					enrichLinks(links, f)
 					if cfg.AnalyzeJS {
 						if isJSURL(url) {
-							jsLinks := jsanalyzer.Parse(result.Body, url, cfg.APIFull)
+							jsLinks, jsObs := jsanalyzer.Parse(result.Body, url, cfg.APIFull)
 							enrichLinks(jsLinks, f)
+							fragLinks, fragParams := linker.AnalyzeJS(result.Body, url)
+							enrichLinks(fragLinks, f)
 							links = append(links, jsLinks...)
+							links = append(links, fragLinks...)
+							poolObs(true, jsObs)
+							poolFragments(fragParams)
 						}
 						if strings.Contains(contentType, "html") || strings.Contains(contentType, "text/html") {
 							var combined string
@@ -580,9 +856,14 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 								combined += inline + "\n"
 							}
 							if combined != "" {
-								jsLinks := jsanalyzer.Parse(combined, url, cfg.APIFull)
+								jsLinks, jsObs := jsanalyzer.Parse(combined, url, cfg.APIFull)
 								enrichLinks(jsLinks, f)
+								fragLinks, fragParams := linker.AnalyzeJS(combined, url)
+								enrichLinks(fragLinks, f)
 								links = append(links, jsLinks...)
+								links = append(links, fragLinks...)
+								poolObs(true, jsObs)
+								poolFragments(fragParams)
 							}
 						}
 					}
@@ -603,6 +884,9 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 
 	contentTypes := make(map[string]string)
 	active := 0
+
+	var batchCandidates []string
+	candidateSeen := map[string]bool{}
 
 	for len(pendingURLs) > 0 || active > 0 {
 		for len(pendingURLs) > 0 && len(sem) < maxWorkers {
@@ -641,34 +925,57 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 				continue
 			}
 			shouldCrawl := link.Category == linker.CategoryWebPage || (cfg.AnalyzeJS && link.Category == linker.CategoryWebAsset && isJSURL(link.HREF))
-			if shouldCrawl {
-				resolved := link.Resolved
-				if resolved == "" {
-					resolved = f.ResolveURL(link.HREF)
+			if !shouldCrawl {
+				continue
+			}
+			resolved := link.Resolved
+			if resolved == "" {
+				resolved = f.ResolveURL(link.HREF)
+			}
+			if resolved == "" || visited[resolved] || rt.task.depth >= maxDepth {
+				continue
+			}
+			isAllowed := allDomains
+			if !isAllowed {
+				baseURL := f.GetBaseURL()
+				if baseURL == nil {
+					continue
 				}
-				if resolved != "" && !visited[resolved] && rt.task.depth < maxDepth {
-					isAllowed := allDomains
-					if !isAllowed {
-						baseURL := f.GetBaseURL()
-						if baseURL == nil {
-							continue
-						}
-						baseURLParsed, _ := url.Parse(baseURL.String())
-						targetURLParsed, _ := url.Parse(resolved)
-						if baseURLParsed == nil || targetURLParsed == nil {
-							continue
-						}
-						isAllowed = baseURLParsed.Host == targetURLParsed.Host ||
-							hostInFollowList(targetURLParsed.Host, cfg.FollowDomains)
-					}
-					if isAllowed {
-						pendingURLs = append(pendingURLs, pageTask{resolved, rt.task.depth + 1})
-						visited[resolved] = true
-						p.AddTarget(1)
-					}
+				baseURLParsed, _ := url.Parse(baseURL.String())
+				targetURLParsed, _ := url.Parse(resolved)
+				if baseURLParsed == nil || targetURLParsed == nil {
+					continue
 				}
+				isAllowed = baseURLParsed.Host == targetURLParsed.Host ||
+					hostInFollowList(targetURLParsed.Host, cfg.FollowDomains)
+			}
+			if !isAllowed {
+				continue
+			}
+			if !candidateSeen[resolved] {
+				batchCandidates = append(batchCandidates, resolved)
+				candidateSeen[resolved] = true
 			}
 		}
+
+		// Drop URLs that a now-confirmed pattern absorbs from this batch's
+		// crawl queue so the pattern's instances are not fetched individually.
+		blocked := map[string]bool{}
+		if detector != nil && len(batchCandidates) > 0 {
+			for _, u := range detector.Feed(batchCandidates) {
+				blocked[u] = true
+			}
+		}
+		for _, resolved := range batchCandidates {
+			if blocked[resolved] {
+				continue
+			}
+			pendingURLs = append(pendingURLs, pageTask{resolved, rt.task.depth + 1})
+			visited[resolved] = true
+			p.AddTarget(1)
+		}
+		batchCandidates = batchCandidates[:0]
+		candidateSeen = map[string]bool{}
 	}
 
 	close(taskCh)
@@ -702,20 +1009,20 @@ func applyCustomTags(links []linker.Link) {
 	}
 }
 
-func printResults(allLinks, displayLinks []linker.Link, cfg *config.Config) {
+func printResults(allLinks, displayLinks []linker.Link, groups []urlgroup.Group, cfg *config.Config) {
 	applyCustomTags(allLinks)
 	applyCustomTags(displayLinks)
 	stats := categorizer.Calculate(allLinks, cfg.ShowTags)
 
 	if cfg.Color {
-		printColorResults(allLinks, displayLinks, stats, cfg)
+		printColorResults(allLinks, displayLinks, stats, groups, cfg)
 	} else {
-		printPlainResults(allLinks, displayLinks, stats, cfg)
+		printPlainResults(allLinks, displayLinks, stats, groups, cfg)
 	}
 	printEmulationSummary(cfg)
 }
 
-func printPlainResults(allLinks, displayLinks []linker.Link, stats *categorizer.Stats, cfg *config.Config) {
+func printPlainResults(allLinks, displayLinks []linker.Link, stats *categorizer.Stats, groups []urlgroup.Group, cfg *config.Config) {
 	baseHost := extractDomain(cfg.URL)
 
 	scope := "Same Domain Only"
@@ -847,9 +1154,14 @@ func printPlainResults(allLinks, displayLinks []linker.Link, stats *categorizer.
 	if !hasHidden {
 		fmt.Println("  none")
 	}
+
+	patternsSection := renderURLPatternsPlain(groups)
+	if patternsSection != "" {
+		fmt.Print(patternsSection)
+	}
 }
 
-func printColorResults(allLinks, displayLinks []linker.Link, stats *categorizer.Stats, cfg *config.Config) {
+func printColorResults(allLinks, displayLinks []linker.Link, stats *categorizer.Stats, groups []urlgroup.Group, cfg *config.Config) {
 	baseHost := extractDomain(cfg.URL)
 
 	scope := "Same Domain Only"
@@ -1075,6 +1387,11 @@ func printColorResults(allLinks, displayLinks []linker.Link, stats *categorizer.
 	if !hasHidden {
 		fmt.Println("    none")
 	}
+
+	patternsSection := renderURLPatternsColored(groups)
+	if patternsSection != "" {
+		fmt.Print(patternsSection)
+	}
 }
 
 func cleanArgs(args string) string {
@@ -1124,6 +1441,9 @@ func printEmulationSummary(cfg *config.Config) {
 		if s.Errors > 0 {
 			fmt.Printf("%s\n", color.Colorizef(color.Red, "Script errors: %d", s.Errors))
 		}
+		if s.Abandoned > 0 {
+			fmt.Printf("%s\n", color.Colorizef(color.Red, "Abandoned native hangs: %d (emulation may be disabled)", s.Abandoned))
+		}
 
 		if len(s.List) > 0 || s.Errors > 0 {
 			fmt.Println()
@@ -1163,6 +1483,9 @@ func printEmulationSummary(cfg *config.Config) {
 		}
 		if s.Errors > 0 {
 			fmt.Printf("Script errors: %d\n", s.Errors)
+		}
+		if s.Abandoned > 0 {
+			fmt.Printf("Abandoned native hangs: %d\n", s.Abandoned)
 		}
 
 		if len(s.List) > 0 || s.Errors > 0 {
@@ -1350,22 +1673,49 @@ func normalizeEmuError(e string) string {
 // emulatePage runs the full semantic engine over one page and returns the
 // discovered endpoints as links attributed to that page.
 func emulatePage(pageHTML, pageURL string, f *fetcher.Fetcher) []linker.Link {
-	// Bound concurrent emulations: each holds a goja VM plus large script
-	// buffers, so unbounded parallelism (one per crawl worker) is what exhausts
-	// memory. Acquire before fetching/parsing scripts to cap total footprint.
+	// Collect scripts first: downloading external bundles is network-bound and
+	// would idle an emulation slot (and thus the whole pool) behind a slow
+	// script server. The slot is then held only during VM execution, which is
+	// where the memory/CPU footprint actually comes from.
+	scripts := collectPageScripts(pageHTML, pageURL, f)
+	if len(scripts) == 0 {
+		return nil
+	}
 	if emuSem != nil {
 		emuSem <- struct{}{}
 		defer func() { <-emuSem }()
 	}
 
-	scripts := collectPageScripts(pageHTML, pageURL, f)
-	if len(scripts) == 0 {
-		return nil
-	}
-
 	sb := emulator.NewWithLimits(pageURL, emuLimits)
+	sb.SetPageHTML(pageHTML)
 	sb.Run(scripts)
 	sum := sb.Summary()
+
+	// Requests that carry data feed the API-contract inference pool.
+	if len(sum.List) > 0 {
+		var obs []contract.Observation
+		for _, c := range sum.List {
+			switch c.Type {
+			case "fetch", "xhr", "beacon", "websocket", "eventsource":
+				method := c.Method
+				if method == "" {
+					method = "GET"
+				}
+				body := c.Body
+				if len(body) > 4096 {
+					body = body[:4096]
+				}
+				var headers []contract.NameValue
+				for _, h := range c.Headers {
+					headers = append(headers, contract.NameValue{Name: h.Name, Value: h.Value})
+				}
+				obs = append(obs, contract.Observation{URL: c.URL, Method: method, Headers: headers, Body: body})
+			}
+		}
+		if len(obs) > 0 {
+			poolObs(true, obs)
+		}
+	}
 
 	emuAgg.mu.Lock()
 	emuAgg.scripts += sum.Scripts
@@ -1442,6 +1792,7 @@ func aggregatedEmuSummary() *emulator.Summary {
 		Errors:    len(errList),
 		ErrorList: errList,
 		List:      list,
+		Abandoned: emulator.AbandonedReports(),
 	}
 }
 

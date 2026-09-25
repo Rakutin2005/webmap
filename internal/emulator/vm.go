@@ -2,6 +2,7 @@ package emulator
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -34,6 +35,19 @@ type gojaVM struct {
 	maxJobs   int
 	deadline  time.Time
 	stopped   *int32
+
+	domRoot *domEl
+	domByID map[string]*domEl
+	domGobj map[*goja.Object]*domEl
+	domAll  []*domEl
+
+	// serializers encodes body-ish objects (URLSearchParams, Blob, ...) to
+	// their wire string so captured request bodies are faithful.
+	serializers map[*goja.Object]func() string
+	// headerStore holds entries of Headers instances.
+	headerStore map[*goja.Object][]HeaderPair
+	// formStore holds FormData entries.
+	formStore map[*goja.Object][]HeaderPair
 }
 
 func newVM(sb *Sandbox, base string) (*gojaVM, error) {
@@ -41,10 +55,13 @@ func newVM(sb *Sandbox, base string) (*gojaVM, error) {
 	runtime.SetParserOptions(parser.WithDisableSourceMaps)
 
 	vm := &gojaVM{
-		runtime:  runtime,
-		sb:       sb,
-		handlers: map[string][]goja.Callable{},
-		maxJobs:  defaultMaxJobs,
+		runtime:     runtime,
+		sb:          sb,
+		handlers:    map[string][]goja.Callable{},
+		maxJobs:     defaultMaxJobs,
+		serializers: map[*goja.Object]func() string{},
+		headerStore: map[*goja.Object][]HeaderPair{},
+		formStore:   map[*goja.Object][]HeaderPair{},
 	}
 	if base != "" {
 		if u, err := url.Parse(base); err == nil {
@@ -137,8 +154,80 @@ func (vm *gojaVM) resolve(raw string) string {
 	return vm.base.ResolveReference(u).String()
 }
 
+// bodyValueString serializes a request body value: plain strings pass through,
+// URLSearchParams/FormData/Blob compile to their wire encoding, plain objects
+// are JSON-encoded.
+func (vm *gojaVM) bodyValueString(v goja.Value) string {
+	if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
+		return ""
+	}
+	o, ok := v.(*goja.Object)
+	if !ok {
+		return v.String()
+	}
+	if f := vm.serializers[o]; f != nil {
+		return f()
+	}
+	if pairs := vm.formStore[o]; pairs != nil {
+		return encodePairsFrom(pairs)
+	}
+	exp := o.Export()
+	if exp == nil {
+		return o.String()
+	}
+	if s, ok := exp.(string); ok {
+		return s
+	}
+	if b, ok := exp.([]byte); ok {
+		return string(b)
+	}
+	if b, err := json.Marshal(exp); err == nil {
+		return string(b)
+	}
+	return o.String()
+}
+
+// encodePairsFrom renders form entries as application/x-www-form-urlencoded.
+func encodePairsFrom(pairs []HeaderPair) string {
+	var parts []string
+	for _, p := range pairs {
+		parts = append(parts, url.QueryEscape(p.Name)+"="+url.QueryEscape(p.Value))
+	}
+	return strings.Join(parts, "&")
+}
+
+// headersFromValue converts a fetch/second-arg headers value (Headers
+// instance, plain object, array of pairs) into ordered assignments.
+func (vm *gojaVM) headersFromValue(v goja.Value) []HeaderPair {
+	if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
+		return nil
+	}
+	o, ok := v.(*goja.Object)
+	if !ok {
+		return nil
+	}
+	if pairs := vm.headerStore[o]; pairs != nil {
+		return append([]HeaderPair(nil), pairs...)
+	}
+	var out []HeaderPair
+	for _, k := range o.Keys() {
+		val := o.Get(k)
+		if goja.IsUndefined(val) || goja.IsNull(val) {
+			continue
+		}
+		out = append(out, HeaderPair{Name: k, Value: val.String()})
+	}
+	return out
+}
+
+// headSetter pushes a header assignment onto a Headers store.
+func (vm *gojaVM) headSetter(o *goja.Object, name, value string) {
+	pairs := vm.headerStore[o]
+	vm.headerStore[o] = append(pairs, HeaderPair{Name: name, Value: value})
+}
+
 // record captures a network sink hit with its fully-resolved URL.
-func (vm *gojaVM) record(rawURL, method, typ string) {
+func (vm *gojaVM) record(rawURL, method, typ string, extra ...recordExtra) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return
@@ -153,13 +242,24 @@ func (vm *gojaVM) record(rawURL, method, typ string) {
 	if initiator == "" && vm.base != nil {
 		initiator = vm.base.String()
 	}
-	vm.sb.addCall(NetworkCall{
+	c := NetworkCall{
 		URL:       vm.resolve(rawURL),
 		RawURL:    rawURL,
 		Method:    strings.ToUpper(method),
 		Type:      typ,
 		Initiator: initiator,
-	})
+	}
+	if len(extra) > 0 {
+		c.Body = extra[0].body
+		c.Headers = extra[0].headers
+	}
+	vm.sb.addCall(c)
+}
+
+// recordExtra is the optional payload attached to a recorded call.
+type recordExtra struct {
+	body    string
+	headers []HeaderPair
 }
 
 func (vm *gojaVM) fn(f func(goja.FunctionCall) goja.Value) goja.Value {
@@ -302,14 +402,22 @@ func (vm *gojaVM) injectFetch() {
 	fetchFn := vm.fn(func(call goja.FunctionCall) goja.Value {
 		u := vm.argURL(call.Argument(0))
 		method := "GET"
+		var body string
+		var headers []HeaderPair
 		if len(call.Arguments) > 1 {
 			if opts := call.Arguments[1].ToObject(r); opts != nil {
 				if m := opts.Get("method"); m != nil && !goja.IsUndefined(m) {
 					method = m.String()
 				}
+				if b := opts.Get("body"); b != nil && !goja.IsUndefined(b) && !goja.IsNull(b) {
+					body = vm.bodyValueString(b)
+				}
+				if h := opts.Get("headers"); h != nil && !goja.IsUndefined(h) && !goja.IsNull(h) {
+					headers = vm.headersFromValue(h)
+				}
 			}
 		}
-		vm.record(u, method, "fetch")
+		vm.record(u, method, "fetch", recordExtra{body: body, headers: headers})
 		return vm.makeResponsePromise(u)
 	})
 	r.Set("fetch", fetchFn)
@@ -319,14 +427,22 @@ func (vm *gojaVM) injectFetch() {
 	r.Set("Request", func(call goja.ConstructorCall, rt *goja.Runtime) *goja.Object {
 		u := vm.argURL(call.Argument(0))
 		method := "GET"
+		var body string
+		var headers []HeaderPair
 		if len(call.Arguments) > 1 {
 			if opts := call.Arguments[1].ToObject(rt); opts != nil {
 				if m := opts.Get("method"); m != nil && !goja.IsUndefined(m) {
 					method = m.String()
 				}
+				if b := opts.Get("body"); b != nil && !goja.IsUndefined(b) && !goja.IsNull(b) {
+					body = vm.bodyValueString(b)
+				}
+				if h := opts.Get("headers"); h != nil && !goja.IsUndefined(h) && !goja.IsNull(h) {
+					headers = vm.headersFromValue(h)
+				}
 			}
 		}
-		vm.record(u, method, "fetch")
+		vm.record(u, method, "fetch", recordExtra{body: body, headers: headers})
 		o := rt.NewObject()
 		o.Set("url", vm.resolve(u))
 		o.Set("method", strings.ToUpper(method))
@@ -334,12 +450,40 @@ func (vm *gojaVM) injectFetch() {
 	})
 	r.Set("Headers", func(call goja.ConstructorCall, rt *goja.Runtime) *goja.Object {
 		o := rt.NewObject()
-		o.Set("append", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
-		o.Set("set", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
-		o.Set("get", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Null() }))
-		o.Set("has", vm.fn(func(goja.FunctionCall) goja.Value { return rt.ToValue(false) }))
+		if len(call.Arguments) > 0 {
+			for _, h := range vm.headersFromValue(call.Argument(0)) {
+				vm.headSetter(o, h.Name, h.Value)
+			}
+		}
+		o.Set("append", vm.fn(func(c goja.FunctionCall) goja.Value {
+			vm.headSetter(o, c.Argument(0).String(), c.Argument(1).String())
+			return goja.Undefined()
+		}))
+		o.Set("set", vm.fn(func(c goja.FunctionCall) goja.Value {
+			vm.headSetter(o, c.Argument(0).String(), c.Argument(1).String())
+			return goja.Undefined()
+		}))
+		o.Set("get", vm.fn(func(c goja.FunctionCall) goja.Value {
+			return rt.ToValue(vm.headerGet(o, c.Argument(0).String()))
+		}))
+		o.Set("has", vm.fn(func(c goja.FunctionCall) goja.Value {
+			return rt.ToValue(vm.headerHas(o, c.Argument(0).String()))
+		}))
 		return o
 	})
+}
+
+func (vm *gojaVM) headerGet(o *goja.Object, name string) string {
+	for _, p := range vm.headerStore[o] {
+		if strings.EqualFold(p.Name, name) {
+			return p.Value
+		}
+	}
+	return ""
+}
+
+func (vm *gojaVM) headerHas(o *goja.Object, name string) bool {
+	return vm.headerGet(o, name) != ""
 }
 
 // makeResponsePromise returns a resolved Promise exposing a minimal fetch
@@ -397,7 +541,10 @@ func (vm *gojaVM) injectXHR() {
 			vm.record(u, method, "xhr")
 			return goja.Undefined()
 		}))
-		x.Set("setRequestHeader", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
+		x.Set("setRequestHeader", vm.fn(func(c goja.FunctionCall) goja.Value {
+			vm.headSetter(x, c.Argument(0).String(), c.Argument(1).String())
+			return goja.Undefined()
+		}))
 		x.Set("overrideMimeType", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
 		x.Set("abort", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
 		x.Set("getAllResponseHeaders", vm.fn(func(goja.FunctionCall) goja.Value { return rt.ToValue("") }))
@@ -411,6 +558,20 @@ func (vm *gojaVM) injectXHR() {
 		}))
 		x.Set("removeEventListener", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
 		x.Set("send", vm.fn(func(c goja.FunctionCall) goja.Value {
+			// Attach the payload and headers captured on open+setRequestHeader
+			// so the contract sees the actual body/headers sent.
+			if len(c.Arguments) > 0 && !goja.IsUndefined(c.Argument(0)) && !goja.IsNull(c.Argument(0)) {
+				if u := x.Get("_url"); u != nil {
+					m := "GET"
+					if mm := x.Get("_method"); mm != nil {
+						m = mm.String()
+					}
+					vm.record(u.String(), m, "xhr", recordExtra{
+						body:    vm.bodyValueString(c.Argument(0)),
+						headers: append([]HeaderPair(nil), vm.headerStore[x]...),
+					})
+				}
+			}
 			// Simulate a completed request so onload/onreadystatechange chains
 			// that issue further first-order calls get a chance to run.
 			x.Set("readyState", 4)
@@ -502,7 +663,11 @@ func (vm *gojaVM) injectNavigator() {
 	nav.Set("doNotTrack", "1")
 	nav.Set("sendBeacon", vm.fn(func(call goja.FunctionCall) goja.Value {
 		u := vm.argURL(call.Argument(0))
-		vm.record(u, "POST", "beacon")
+		var body string
+		if len(call.Arguments) > 1 && !goja.IsUndefined(call.Argument(1)) && !goja.IsNull(call.Argument(1)) {
+			body = vm.bodyValueString(call.Argument(1))
+		}
+		vm.record(u, "POST", "beacon", recordExtra{body: body})
 		return r.ToValue(true)
 	}))
 	nav.Set("serviceWorker", func() *goja.Object {
@@ -535,16 +700,36 @@ func (vm *gojaVM) injectDocument() {
 	doc.Set("createComment", vm.fn(func(goja.FunctionCall) goja.Value { return r.NewObject() }))
 	doc.Set("createDocumentFragment", vm.fn(func(goja.FunctionCall) goja.Value { return vm.newElement("fragment") }))
 
-	emptyArr := vm.fn(func(goja.FunctionCall) goja.Value { return r.NewArray() })
-	// Return a permissive element rather than null so that init code guarded by
-	// `if (el)` proceeds far enough to register its handlers and issue calls.
-	elemFn := vm.fn(func(goja.FunctionCall) goja.Value { return vm.newElement("div") })
-	doc.Set("getElementById", elemFn)
-	doc.Set("querySelector", elemFn)
-	doc.Set("querySelectorAll", emptyArr)
-	doc.Set("getElementsByTagName", emptyArr)
-	doc.Set("getElementsByClassName", emptyArr)
-	doc.Set("getElementsByName", emptyArr)
+	// Real-DOM-aware lookups: when page HTML was fed via SetPageHTML these
+	// return actual elements with populated attributes; otherwise (or for
+	// not-found/unsupported selectors) they degrade to the permissive element
+	// / empty array so library init code proceeds as it always has.
+	doc.Set("getElementById", vm.fn(func(call goja.FunctionCall) goja.Value {
+		if de := vm.domByID[call.Argument(0).String()]; de != nil {
+			return de.gobj
+		}
+		// Permissive element rather than null so that init code guarded by
+		// `if (el)` proceeds far enough to register its handlers and issue calls.
+		return vm.newElement("div")
+	}))
+	doc.Set("querySelector", vm.fn(func(call goja.FunctionCall) goja.Value {
+		if o := vm.domQuery(call.Argument(0).String()); o != nil {
+			return o
+		}
+		return vm.newElement("div")
+	}))
+	doc.Set("querySelectorAll", vm.fn(func(call goja.FunctionCall) goja.Value {
+		return vm.domArray(vm.domQueryAll(call.Argument(0).String()))
+	}))
+	doc.Set("getElementsByTagName", vm.fn(func(call goja.FunctionCall) goja.Value {
+		return vm.domArray(vm.domTagAll(strings.ToLower(call.Argument(0).String())))
+	}))
+	doc.Set("getElementsByClassName", vm.fn(func(call goja.FunctionCall) goja.Value {
+		return vm.domArray(vm.domClassAll(strings.Fields(call.Argument(0).String())))
+	}))
+	doc.Set("getElementsByName", vm.fn(func(call goja.FunctionCall) goja.Value {
+		return vm.domArray(vm.domNameAll(call.Argument(0).String()))
+	}))
 	doc.Set("addEventListener", vm.fn(func(call goja.FunctionCall) goja.Value {
 		ev := call.Argument(0).String()
 		if fn, ok := goja.AssertFunction(call.Argument(1)); ok {
@@ -603,29 +788,69 @@ func (vm *gojaVM) injectDocument() {
 	r.Set("document", doc)
 }
 
+// locationState holds the mutable location fields; the accessors below both
+// update them and (for navigation triggers) record the outbound request.
+type locationState struct {
+	href, origin, protocol, host, hostname, pathname, search, hash, port string
+}
+
 func (vm *gojaVM) injectLocationAndWindow() {
 	r := vm.runtime
+	g := r.GlobalObject()
 	loc := r.NewObject()
-	href, origin, proto, host, hostname, path := "about:blank", "null", "about:", "", "", "/"
+
+	state := &locationState{}
 	if vm.base != nil {
-		href = vm.base.String()
-		proto = vm.base.Scheme + ":"
-		host = vm.base.Host
-		hostname = vm.base.Hostname()
-		origin = vm.base.Scheme + "://" + vm.base.Host
-		if vm.base.Path != "" {
-			path = vm.base.Path
+		b := vm.base
+		if b.Scheme != "" {
+			state.protocol = b.Scheme + ":"
+			state.origin = b.Scheme + "://" + b.Host
+		}
+		state.href = b.String()
+		state.host = b.Host
+		state.hostname = b.Hostname()
+		state.port = b.Port()
+		if b.Path != "" {
+			state.pathname = b.Path
+		}
+	} else {
+		state.href, state.origin, state.protocol, state.pathname = "about:blank", "null", "about:", "/"
+	}
+
+	// Install an accessor for each location field. `href` (and only href)
+	// records a navigation when assigned; the rest just keep state consistent
+	// so later reads/building see the mutated value.
+	setter := func(field *string, record bool) func(goja.FunctionCall) goja.Value {
+		return func(call goja.FunctionCall) goja.Value {
+			*field = call.Argument(0).String()
+			if record {
+				vm.record(*field, "GET", "navigation")
+			}
+			return goja.Undefined()
 		}
 	}
-	loc.Set("href", href)
-	loc.Set("origin", origin)
-	loc.Set("protocol", proto)
-	loc.Set("host", host)
-	loc.Set("hostname", hostname)
-	loc.Set("pathname", path)
-	loc.Set("search", "")
-	loc.Set("hash", "")
-	loc.Set("port", "")
+	getter := func(field *string) func(goja.FunctionCall) goja.Value {
+		return func(goja.FunctionCall) goja.Value { return r.ToValue(*field) }
+	}
+	props := []struct {
+		name   string
+		field  *string
+		record bool
+	}{
+		{"href", &state.href, true},
+		{"origin", &state.origin, false},
+		{"protocol", &state.protocol, false},
+		{"host", &state.host, false},
+		{"hostname", &state.hostname, false},
+		{"pathname", &state.pathname, false},
+		{"search", &state.search, false},
+		{"hash", &state.hash, false},
+		{"port", &state.port, false},
+	}
+	for _, p := range props {
+		_ = loc.DefineAccessorProperty(p.name, vm.fn(getter(p.field)), vm.fn(setter(p.field, p.record)), goja.FLAG_TRUE, goja.FLAG_TRUE)
+	}
+
 	loc.Set("assign", vm.fn(func(call goja.FunctionCall) goja.Value {
 		vm.record(vm.argURL(call.Argument(0)), "GET", "navigation")
 		return goja.Undefined()
@@ -635,8 +860,27 @@ func (vm *gojaVM) injectLocationAndWindow() {
 		return goja.Undefined()
 	}))
 	loc.Set("reload", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
-	loc.Set("toString", vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue(href) }))
-	r.Set("location", loc)
+	loc.Set("toString", vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue(state.href) }))
+
+	// Make the global `location` itself an accessor so `window.location = url`
+	// (and `location = url`) is recorded as a navigation, not silently replaced.
+	_ = g.DefineAccessorProperty("location",
+		vm.fn(func(goja.FunctionCall) goja.Value { return loc }),
+		vm.fn(func(call goja.FunctionCall) goja.Value {
+			arg := call.Argument(0)
+			if obj, ok := arg.(*goja.Object); ok {
+				if u := obj.Get("href"); u != nil && !goja.IsUndefined(u) && !goja.IsNull(u) {
+					state.href = u.String()
+				} else {
+					state.href = obj.String()
+				}
+			} else {
+				state.href = arg.String()
+			}
+			vm.record(state.href, "GET", "navigation")
+			return goja.Undefined()
+		}),
+		goja.FLAG_TRUE, goja.FLAG_TRUE)
 
 	hist := r.NewObject()
 	hist.Set("pushState", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
@@ -645,6 +889,12 @@ func (vm *gojaVM) injectLocationAndWindow() {
 	hist.Set("back", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
 	hist.Set("forward", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
 	r.Set("history", hist)
+
+	// Browsers alias document.location === window.location; Bitrix (pull client,
+	// translatorjs) reads document.location.hostname/href directly.
+	if doc, ok := r.Get("document").(*goja.Object); ok {
+		doc.Set("location", loc)
+	}
 
 	r.Set("addEventListener", vm.fn(func(call goja.FunctionCall) goja.Value {
 		ev := call.Argument(0).String()
@@ -724,9 +974,36 @@ func (vm *gojaVM) injectMisc() {
 	// FormData/Blob minimal stubs so request-building code runs.
 	r.Set("FormData", func(call goja.ConstructorCall, rt *goja.Runtime) *goja.Object {
 		o := rt.NewObject()
-		o.Set("append", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
-		o.Set("set", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
-		o.Set("get", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Null() }))
+		if len(call.Arguments) > 0 {
+			if form := vm.formStore[call.Argument(0).ToObject(rt)]; form != nil {
+				vm.formStore[o] = append(vm.formStore[o], form...)
+			}
+		}
+		o.Set("append", vm.fn(func(c goja.FunctionCall) goja.Value {
+			vm.formStore[o] = append(vm.formStore[o], HeaderPair{Name: c.Argument(0).String(), Value: c.Argument(1).String()})
+			return goja.Undefined()
+		}))
+		o.Set("set", vm.fn(func(c goja.FunctionCall) goja.Value {
+			name := c.Argument(0).String()
+			pairs := vm.formStore[o][:0]
+			for _, p := range vm.formStore[o] {
+				if p.Name != name {
+					pairs = append(pairs, p)
+				}
+			}
+			pairs = append(pairs, HeaderPair{Name: name, Value: c.Argument(1).String()})
+			vm.formStore[o] = pairs
+			return goja.Undefined()
+		}))
+		o.Set("get", vm.fn(func(c goja.FunctionCall) goja.Value {
+			name := c.Argument(0).String()
+			for _, p := range vm.formStore[o] {
+				if p.Name == name {
+					return rt.ToValue(p.Value)
+				}
+			}
+			return goja.Null()
+		}))
 		return o
 	})
 	r.Set("Blob", func(call goja.ConstructorCall, rt *goja.Runtime) *goja.Object {
@@ -750,10 +1027,26 @@ func (vm *gojaVM) injectMisc() {
 		"HTMLInputElement", "HTMLFormElement", "HTMLIFrameElement", "SVGElement",
 		"Event", "CustomEvent", "MouseEvent", "KeyboardEvent", "PointerEvent",
 		"Text", "Comment", "NodeList", "HTMLCollection", "DOMParser", "XPathEvaluator",
-		"FileReader", "File", "MessageChannel", "Worker",
+		"FileReader", "File", "MessageChannel",
 	} {
 		r.Set(name, emptyCtor)
 	}
+
+	// Worker/SharedWorker pull the worker entry script over the network — record
+	// it as a script resource (Web Workers/DedicatedWorkerGlobalScope).
+	r.Set("Worker", func(call goja.ConstructorCall, rt *goja.Runtime) *goja.Object {
+		vm.record(vm.argURL(call.Argument(0)), "GET", "script")
+		w := rt.NewObject()
+		w.Set("postMessage", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
+		w.Set("terminate", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
+		w.Set("addEventListener", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
+		w.Set("removeEventListener", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
+		return w
+	})
+	r.Set("SharedWorker", func(call goja.ConstructorCall, rt *goja.Runtime) *goja.Object {
+		vm.record(vm.argURL(call.Argument(0)), "GET", "script")
+		return rt.NewObject()
+	})
 
 	// Observer constructors — return an object with the standard no-op methods.
 	observerCtor := func(call goja.ConstructorCall, rt *goja.Runtime) *goja.Object {
@@ -862,31 +1155,66 @@ func (vm *gojaVM) injectMisc() {
 func (vm *gojaVM) newElement(tag string) goja.Value {
 	r := vm.runtime
 	el := r.NewObject()
+	vm.wireElement(el, tag, nil, true)
+	return el
+}
+
+// wireElement populates an element object with its methods and URL accessors.
+// seed carries static attributes from real page HTML: URL-bearing ones are
+// seeded into their accessors so reads return the resolved URL while later
+// runtime assignment still records a call. Seeded static values are NOT
+// recorded — the HTML crawler already owns those resources. nil seed produces
+// a plain dynamically-created element (everything records, as before).
+func (vm *gojaVM) wireElement(el *goja.Object, tag string, seed map[string]string, dynamic bool) *goja.Object {
+	r := vm.runtime
 	el.Set("tagName", strings.ToUpper(tag))
 	el.Set("nodeName", strings.ToUpper(tag))
 	el.Set("nodeType", 1)
 	el.Set("className", "")
 	el.Set("id", "")
-	el.Set("innerHTML", "")
-	el.Set("innerText", "")
-	el.Set("textContent", "")
+	if !dynamic {
+		// Statically built elements carry plain string props populated from the
+		// parsed document; runtime-created elements get real innerHTML/textContent
+		// accessors below.
+		el.Set("innerHTML", "")
+		el.Set("innerText", "")
+		el.Set("textContent", "")
+	}
 	el.Set("value", "")
+	typ := elementResourceType(tag)
 	style := r.NewObject()
-	style.Set("setProperty", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
+	style.Set("setProperty", vm.fn(func(call goja.FunctionCall) goja.Value {
+		// background-image: url(...) assigned via setProperty('backgroundImage', v).
+		if isCSSURLProp(call.Argument(0).String()) {
+			for _, u := range extractCSSURLs(call.Argument(1).String()) {
+				vm.record(u, "GET", typ)
+			}
+		}
+		return goja.Undefined()
+	}))
 	style.Set("removeProperty", vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue("") }))
 	style.Set("getPropertyValue", vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue("") }))
 	style.Set("item", vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue("") }))
-	style.Set("cssText", "")
+	// URL-bearing inline CSS properties and the whole cssText string: assigning
+	// `el.style.backgroundImage = 'url(...)'` records the resource.
+	for _, p := range []string{"backgroundImage", "background", "listStyleImage", "borderImageSource", "maskImage", "WebkitMaskImage", "content", "cssText"} {
+		vm.defineStyleURLProp(style, p, typ)
+	}
 	el.Set("style", style)
 	el.Set("dataset", r.NewObject())
 	el.Set("children", r.NewArray())
 	el.Set("childNodes", r.NewArray())
 
-	typ := elementResourceType(tag)
-	vm.defineURLSetter(el, "src", typ)
-	vm.defineURLSetter(el, "href", typ)
-	vm.defineURLSetter(el, "action", "form")
-	vm.defineURLSetter(el, "data", typ)
+	vm.defineURLSetterSeed(el, "src", typ, seedVal(seed, "src"))
+	vm.defineURLSetterSeed(el, "href", typ, seedVal(seed, "href"))
+	vm.defineURLSetterSeed(el, "action", "form", seedVal(seed, "action"))
+	vm.defineURLSetterSeed(el, "data", typ, seedVal(seed, "data"))
+	vm.defineSrcsetSetter(el, typ)
+	if sv := seedVal(seed, "srcset"); sv != "" {
+		// Static srcset candidates are a discovery the HTML crawler does not
+		// parse, so this assignment deliberately records each one.
+		el.Set("srcset", sv)
+	}
 
 	el.Set("setAttribute", vm.fn(func(call goja.FunctionCall) goja.Value {
 		name := strings.ToLower(call.Argument(0).String())
@@ -904,6 +1232,11 @@ func (vm *gojaVM) newElement(tag string) goja.Value {
 		case "data":
 			vm.record(val, "GET", typ)
 			el.Set("data", vm.resolve(val))
+		case "srcset":
+			for _, u := range parseSrcset(val) {
+				vm.record(u, "GET", typ)
+			}
+			el.Set("srcset", val)
 		default:
 			el.Set(name, val)
 		}
@@ -968,6 +1301,71 @@ func (vm *gojaVM) newElement(tag string) goja.Value {
 		adopt(call.Argument(0))
 		return call.Argument(0)
 	}))
+	if dynamic {
+		// Runtime elements parse innerHTML assignments into real child elements so
+		// DOM-driven discovery works (vue's decodeEntities does
+		// `d.innerHTML=...; d.children[0].getAttribute('...')`). Resource-loading
+		// attributes inside the fragment are recorded — a browser fetches them,
+		// exactly like static srcset/style url() discovery. innerText/textContent
+		// assignment follows the spec: the subtree is replaced by plain text.
+		var rawHTML string
+		var ownText string
+		setInnerHTML := func(s string) {
+			rawHTML = s
+			ownText = ""
+			for _, c := range children {
+				c.Set("parentNode", goja.Null())
+				c.Set("parentElement", goja.Null())
+			}
+			children = children[:0]
+			nodes := parseFragmentChildren(s)
+			for _, cn := range nodes {
+				if sub := vm.detachedNode(cn); sub != nil {
+					adopt(sub)
+				}
+			}
+			vm.recordFragmentResources(nodes)
+			sync()
+		}
+		setText := func(s string) {
+			ownText = s
+			rawHTML = ""
+			for _, c := range children {
+				c.Set("parentNode", goja.Null())
+				c.Set("parentElement", goja.Null())
+			}
+			children = children[:0]
+			sync()
+		}
+		getText := func() string {
+			var b strings.Builder
+			b.WriteString(ownText)
+			for _, c := range children {
+				if v := c.Get("textContent"); v != nil {
+					b.WriteString(v.String())
+				}
+			}
+			return b.String()
+		}
+		el.DefineAccessorProperty("innerHTML",
+			vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue(rawHTML) }),
+			vm.fn(func(call goja.FunctionCall) goja.Value {
+				setInnerHTML(call.Argument(0).String())
+				return goja.Undefined()
+			}), goja.FLAG_TRUE, goja.FLAG_TRUE)
+		el.DefineAccessorProperty("innerText",
+			vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue(getText()) }),
+			vm.fn(func(call goja.FunctionCall) goja.Value {
+				setText(call.Argument(0).String())
+				return goja.Undefined()
+			}), goja.FLAG_TRUE, goja.FLAG_TRUE)
+		el.DefineAccessorProperty("textContent",
+			vm.fn(func(goja.FunctionCall) goja.Value { return r.ToValue(getText()) }),
+			vm.fn(func(call goja.FunctionCall) goja.Value {
+				setText(call.Argument(0).String())
+				return goja.Undefined()
+			}), goja.FLAG_TRUE, goja.FLAG_TRUE)
+	}
 	el.Set("append", vm.fn(func(call goja.FunctionCall) goja.Value {
 		for _, a := range call.Arguments {
 			adopt(a)
@@ -995,9 +1393,18 @@ func (vm *gojaVM) newElement(tag string) goja.Value {
 	el.Set("remove", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
 	el.Set("addEventListener", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
 	el.Set("removeEventListener", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Undefined() }))
-	el.Set("querySelector", vm.fn(func(goja.FunctionCall) goja.Value { return goja.Null() }))
-	el.Set("querySelectorAll", vm.fn(func(goja.FunctionCall) goja.Value { return r.NewArray() }))
-	el.Set("getElementsByTagName", vm.fn(func(goja.FunctionCall) goja.Value { return r.NewArray() }))
+	el.Set("querySelector", vm.fn(func(call goja.FunctionCall) goja.Value {
+		if list := vm.domScopedAll(el, call.Argument(0).String()); len(list) > 0 {
+			return list[0]
+		}
+		return goja.Null()
+	}))
+	el.Set("querySelectorAll", vm.fn(func(call goja.FunctionCall) goja.Value {
+		return vm.domArray(vm.domScopedAll(el, call.Argument(0).String()))
+	}))
+	el.Set("getElementsByTagName", vm.fn(func(call goja.FunctionCall) goja.Value {
+		return vm.domArray(vm.domScopedTag(el, strings.ToLower(call.Argument(0).String())))
+	}))
 	el.Set("submit", vm.fn(func(goja.FunctionCall) goja.Value {
 		if a := el.Get("action"); a != nil && !goja.IsUndefined(a) && !goja.IsNull(a) {
 			vm.record(a.String(), "POST", "form")
@@ -1105,7 +1512,24 @@ func (vm *gojaVM) newElement(tag string) goja.Value {
 // defineURLSetter installs an accessor property that records a network call
 // whenever a URL-shaped value is assigned to it (e.g. script.src = url).
 func (vm *gojaVM) defineURLSetter(o *goja.Object, prop, typ string) {
+	vm.defineURLSetterSeed(o, prop, typ, "")
+}
+
+func seedVal(seed map[string]string, k string) string {
+	if seed == nil {
+		return ""
+	}
+	return seed[k]
+}
+
+// defineURLSetterSeed is defineURLSetter with an optional initial value that is
+// stored without recording (static HTML attribute); later assignments still
+// record.
+func (vm *gojaVM) defineURLSetterSeed(o *goja.Object, prop, typ, initial string) {
 	stored := ""
+	if initial != "" {
+		stored = vm.resolve(initial)
+	}
 	getter := vm.fn(func(goja.FunctionCall) goja.Value { return vm.runtime.ToValue(stored) })
 	method := "GET"
 	if prop == "action" {
@@ -1118,6 +1542,104 @@ func (vm *gojaVM) defineURLSetter(o *goja.Object, prop, typ string) {
 		return goja.Undefined()
 	})
 	_ = o.DefineAccessorProperty(prop, getter, setter, goja.FLAG_TRUE, goja.FLAG_TRUE)
+}
+
+// defineSrcsetSetter additionally records each candidate of a srcset attribute
+// ("img-1x.png 1x, img-2x.png 2x") when it is assigned.
+func (vm *gojaVM) defineSrcsetSetter(o *goja.Object, typ string) {
+	stored := ""
+	_ = o.DefineAccessorProperty("srcset",
+		vm.fn(func(goja.FunctionCall) goja.Value { return vm.runtime.ToValue(stored) }),
+		vm.fn(func(call goja.FunctionCall) goja.Value {
+			v := call.Argument(0).String()
+			stored = v
+			for _, u := range parseSrcset(v) {
+				vm.record(u, "GET", typ)
+			}
+			return goja.Undefined()
+		}),
+		goja.FLAG_TRUE, goja.FLAG_TRUE)
+}
+
+// defineStyleURLProp makes a CSS property an accessor that, when set to a value
+// containing url(...) tokens, records each URL as a resource load.
+func (vm *gojaVM) defineStyleURLProp(o *goja.Object, prop, typ string) {
+	stored := ""
+	_ = o.DefineAccessorProperty(prop,
+		vm.fn(func(goja.FunctionCall) goja.Value { return vm.runtime.ToValue(stored) }),
+		vm.fn(func(call goja.FunctionCall) goja.Value {
+			v := call.Argument(0).String()
+			stored = v
+			for _, u := range extractCSSURLs(v) {
+				vm.record(u, "GET", typ)
+			}
+			return goja.Undefined()
+		}),
+		goja.FLAG_TRUE, goja.FLAG_TRUE)
+}
+
+// isCSSURLProp reports whether a CSS property name holds URL-bearing values in
+// the form url(...). Accepts camelCase and kebab-case spellings.
+func isCSSURLProp(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	n = strings.ReplaceAll(n, "-", "")
+	switch n {
+	case "background", "backgroundimage", "liststyleimage", "borderimage", "borderimagesource",
+		"maskimage", "webkitmaskimage", "content", "cursor", "filter", "image", "mask":
+		return true
+	}
+	return false
+}
+
+// extractCSSURLs pulls every url(...) reference out of a CSS value string.
+func extractCSSURLs(s string) []string {
+	var out []string
+	rest := s
+	for {
+		i := strings.Index(rest, "url(")
+		if i < 0 {
+			break
+		}
+		rest = rest[i+4:]
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		if rest == "" {
+			break
+		}
+		if rest[0] == '\'' || rest[0] == '"' {
+			q := rest[0]
+			j := strings.IndexByte(rest[1:], q)
+			if j < 0 {
+				break
+			}
+			out = append(out, rest[1:j+1])
+			rest = rest[j+2:]
+			continue
+		}
+		j := strings.IndexAny(rest, ")\"'")
+		if j < 0 {
+			break
+		}
+		out = append(out, strings.TrimSpace(rest[:j]))
+		rest = rest[j+1:]
+	}
+	return out
+}
+
+// parseSrcset splits a srcset attribute into its candidate URLs ("a.png 1x,
+// b.png 2x" → ["a.png", "b.png"]). Commas inside data: URIs are deliberately
+// not special-cased; data: references are dropped by record anyway.
+func parseSrcset(s string) []string {
+	var out []string
+	for _, cand := range strings.Split(s, ",") {
+		cand = strings.TrimSpace(cand)
+		if cand == "" {
+			continue
+		}
+		if f := strings.Fields(cand); len(f) > 0 {
+			out = append(out, f[0])
+		}
+	}
+	return out
 }
 
 func elementResourceType(tag string) string {

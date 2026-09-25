@@ -44,12 +44,18 @@ type Config struct {
 	EmulateWorkers  int
 	EmulateMaxJS    int
 	EmulateMaxJobs  int
+	EmulateMaxLeaks int
+	APIContract     bool
+	APIContractRaw  bool
+	NoGroup         bool
+	GroupCount      int
 }
 
 func Parse() *Config {
 	c := &Config{
 		RecursiveDepth: 5,
 		Threads:        32,
+		GroupCount:     2,
 	}
 
 	flag.StringVar(&c.URL, "url", "", "URL to parse (required)")
@@ -66,6 +72,7 @@ func Parse() *Config {
 	flag.IntVar(&c.EmulateWorkers, "emu-workers", 0, "Emulation: max concurrent page emulations (0 = auto: min(4, CPUs))")
 	flag.IntVar(&c.EmulateMaxJS, "emu-maxjs", 3072, "Emulation: skip scripts larger than this many KB (0 = unlimited)")
 	flag.IntVar(&c.EmulateMaxJobs, "emu-maxjobs", 2000, "Emulation: max event-loop jobs (timers/promises) per page")
+	flag.IntVar(&c.EmulateMaxLeaks, "emu-maxleaks", 2, "Emulation: native hangs to tolerate before emulation disables itself")
 	flag.BoolVar(&c.Graphical, "G", false, "Generate ASCII graph")
 	flag.BoolVar(&c.Markdown, "M", false, "Generate markdown output")
 	flag.BoolVar(&c.Cloudflare, "cf", false, "Parse Cloudflare/WAF protected URLs too")
@@ -75,6 +82,10 @@ func Parse() *Config {
 	flag.BoolVar(&c.Noise, "noise", false, "Show noise (possible non-URL) entries in results")
 	flag.BoolVar(&c.Color, "color", false, "Colorize output")
 	flag.BoolVar(&c.APIFull, "apif", false, "Show full API info (methods, args, match pattern) from JS sources")
+	flag.BoolVar(&c.APIContract, "apic", false, "Show inferred API contracts (endpoint methods, headers, URL/bodies formats, sample bodies)")
+	flag.BoolVar(&c.APIContractRaw, "apic-raw", false, "Show request usage evidence (raw requests) in API contracts; tokens stay masked")
+	flag.BoolVar(&c.NoGroup, "nogroup", false, "Disable URL pattern grouping")
+	flag.IntVar(&c.GroupCount, "group-count", 2, "Minimum number of matching URLs before they are folded into a pattern (default: 2)")
 
 	followLong := flag.String("follow", "", "Comma-separated additional domains to include in the recursive crawl (subdomains included)")
 	followShort := flag.String("f", "", "Alias of -follow")

@@ -246,7 +246,11 @@ var videoTagRegex = regexp.MustCompile(`(?i)<video[^>]+src=["']([^"']+)["'][^>]*
 var audioTagRegex = regexp.MustCompile(`(?i)<audio[^>]+src=["']([^"']+)["'][^>]*>`)
 var iframeTagRegex = regexp.MustCompile(`(?i)<iframe[^>]+src=["']([^"']+)["'][^>]*>`)
 var cssImportRegex = regexp.MustCompile(`(?i)@import\s+['"]([^"']+)['"]`)
-var jsImportRegex = regexp.MustCompile(`(?i)(?:import|export|from|require)\s*\(?\s*['"]([^"']+)['"]`)
+
+// jsImportRegex is applied to raw JS bundels, so the leading keyword must not
+// be a fragment of a longer identifier (le.from, created_from). RE2 has no
+// negative lookbehind, so the excluded prefix class is consumed instead.
+var jsImportRegex = regexp.MustCompile(`(?i)(?:^|[^a-z0-9_.$])(?:import|export|from|require)\b\s*\(?\s*["']([^"']{1,512})["']`)
 
 func Parse(body string, sourceURL string) []Link {
 	links := make([]Link, 0)
@@ -275,6 +279,9 @@ func findLinks(regex *regexp.Regexp, body string, sourceURL string, tag string) 
 		}
 		href := match[1]
 		href = strings.TrimSpace(href)
+		if tag == "js-import" && !isValidModuleSpecifier(href) {
+			continue
+		}
 		if href == "" || strings.HasPrefix(href, "#") || strings.HasPrefix(href, "javascript:") || strings.HasPrefix(href, "mailto:") || strings.HasPrefix(href, "tel:") {
 			continue
 		}
@@ -493,4 +500,146 @@ func hasValidURLChars(s string) bool {
 		}
 	}
 	return false
+}
+
+// isValidModuleSpecifier reports whether a jsImportRegex capture is a
+// plausible module specifier instead of a fragment of minified code (e.g. a
+// switch label, an identifier near a quote, or an interpolation). The regex
+// alone cannot decide this because it runs on raw bundle text.
+func isValidModuleSpecifier(s string) bool {
+	if s == "" || len(s) > 512 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			continue
+		case c == '/', c == '.', c == '_', c == '-', c == '@', c == '~',
+			c == '?', c == '#', c == '=', c == '%', c == '+', c == ':':
+			continue
+		default:
+			return false
+		}
+	}
+	if looksLikeURL(s) || strings.Contains(s, "/") || strings.Contains(s, "@") {
+		return true
+	}
+	// Bare npm-style module names (vue, lodash) are lowercase; camelCase
+	// words such as getAllResponseHeaders are code identifiers, not imports.
+	// URL metacharacters without a path context (e.g. ":case") are fragments.
+	if strings.ContainsAny(s, ":?#=") {
+		return false
+	}
+	return strings.ToLower(s) == s
+}
+
+var (
+	tmplLiteralRegex  = regexp.MustCompile("`([^`\\\\]*(?:\\\\.[^`\\\\]*)*)`")
+	tmplInterpRegex   = regexp.MustCompile(`\$\{([^}]*)\}`)
+	queryParamBuildRe = regexp.MustCompile(`\.(?:set|append)\(\s*["']([A-Za-z_$][\w$]{0,63})["']`)
+)
+
+// AnalyzeJS digs endpoint formation signals out of raw JS bundle text. It
+// returns two kinds of findings that structured parsing routinely misses on
+// minified code:
+//
+//   - url-tmpl links: backtick templates with interpolation that look like a
+//     URL/endpoint (kept with {var} placeholders so the dynamic shape is not
+//     lost);
+//   - query parameter names discovered through the URLSearchParams-style
+//     .set()/.append() builders that assemble runtime request query strings.
+//
+// Nothing here performs network I/O: it is purely lexical analysis.
+func AnalyzeJS(js string, sourceURL string) (templates []Link, params []string) {
+	seenParam := make(map[string]bool)
+	for _, m := range queryParamBuildRe.FindAllStringSubmatch(js, -1) {
+		if len(m) < 2 || seenParam[m[1]] {
+			continue
+		}
+		seenParam[m[1]] = true
+		params = append(params, m[1])
+	}
+
+	seenTmpl := make(map[string]bool)
+	for _, m := range tmplLiteralRegex.FindAllStringSubmatch(js, -1) {
+		if len(m) < 2 || !strings.Contains(m[1], "${") {
+			continue
+		}
+		norm := tmplInterpRegex.ReplaceAllStringFunc(m[1], templatePlaceholder)
+		norm = cleanDynamicTemplate(norm)
+		if norm == "" || strings.Count(norm, "{") > 8 {
+			continue
+		}
+		if seenTmpl[norm] {
+			continue
+		}
+		seenTmpl[norm] = true
+		category := CategoryDynamic
+		if MatchesAPIPattern(norm) {
+			category = CategoryAPI
+		}
+		linkType := LinkTypeRelative
+		if strings.HasPrefix(norm, "http://") || strings.HasPrefix(norm, "https://") {
+			linkType = LinkTypeAbsolute
+		}
+		templates = append(templates, Link{
+			HREF:      norm,
+			Category:  category,
+			LinkType:  linkType,
+			SourceURL: sourceURL,
+			Tag:       "url-tmpl",
+		})
+	}
+	return templates, params
+}
+
+// templatePlaceholder renders a single template interpolation as a readable
+// path placeholder ({id}, {page}, {le.status}) so a dynamic endpoint shape
+// can still be examined. Complex expressions collapse to {…}. The input is the
+// full ${…} match (ReplaceAllStringFunc passes whole matches, not groups).
+func templatePlaceholder(src string) string {
+	name := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSpace(src), "}"), "${")
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "{…}"
+	}
+	if strings.ContainsAny(name, " ()+*/&|?:,<>[]{}=!\"'`;\\$") {
+		return "{…}"
+	}
+	return "{" + name + "}"
+}
+
+// cleanDynamicTemplate keeps only templates that look like URL paths/endpoints
+// and removes incidental whitespace and escapes from the normalized form.
+func cleanDynamicTemplate(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return -1
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+	if s == "" || strings.ContainsAny(s, " \t") {
+		return ""
+	}
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") ||
+		strings.HasPrefix(s, "//") || strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") ||
+		strings.HasPrefix(s, "/") {
+		return s
+	}
+	// ${apiBase}/api/users normalizes to {apiBase}/api/users: the dynamic
+	// scheme/host is fine as long as a real path follows.
+	if strings.HasPrefix(s, "{") {
+		if end := strings.IndexByte(s, '}'); end > 0 && end < len(s)-1 {
+			rest := s[end+1:]
+			if strings.HasPrefix(rest, "/") || strings.HasPrefix(rest, "./") ||
+				strings.HasPrefix(rest, "http://") || strings.HasPrefix(rest, "https://") ||
+				strings.HasPrefix(rest, "//") {
+				return s
+			}
+		}
+	}
+	return ""
 }
