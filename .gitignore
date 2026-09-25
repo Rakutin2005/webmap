@@ -1,10 +1,12 @@
 # Build artifacts
 /webmap
+/wmse
 /dist/
 
 # Analysis outputs (generated per-scan: graph files and web maps)
 *.wmap/
 *.wmap.tar.xz
+*.wmse
 graph.html
 graph.md
 graph.mmd

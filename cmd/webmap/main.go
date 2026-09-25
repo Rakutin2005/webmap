@@ -25,6 +25,7 @@ import (
 	"apimap/internal/patterns"
 	"apimap/internal/progress"
 	"apimap/internal/urlgroup"
+	"apimap/internal/wmse"
 )
 
 var activePatterns *patterns.PatternSet
@@ -44,6 +45,46 @@ var activeLinkByURL map[string]linker.Link
 // contractPatterns holds the pattern URLs that have at least one API contract
 // observation; such patterns render with a <contract> marker.
 var contractPatterns map[string]bool
+
+// pageLog records every URL the crawler actually fetched, with the depth it was
+// reached at. Only the file written by -o uses it, and it exists because "a page
+// links to this" and "the crawl walked this" are different facts: depth limits,
+// class filters and domain rules all drop links from the queue, and afterwards
+// nothing in the link set can tell the difference.
+var (
+	pageMu  sync.Mutex
+	pageLog = map[string]wmse.Page{}
+)
+
+// recordPage notes one fetched page. A URL fetched more than once keeps the
+// shallowest sighting, because that is the path a person can walk, and the
+// largest link count, because that is the richer view of what is on it.
+//
+// The URL recorded is the one that was requested, not the one the response came
+// from. That is what the links found on it name as their source, so recording
+// anything else would give every crawl edge a from-node that is a different
+// node from the page it stands for.
+func recordPage(url string, depth int, contentType string, links int) {
+	if url == "" {
+		return
+	}
+	pageMu.Lock()
+	defer pageMu.Unlock()
+	if p, ok := pageLog[url]; ok {
+		if depth < p.Depth {
+			p.Depth = depth
+		}
+		if p.ContentType == "" {
+			p.ContentType = contentType
+		}
+		if links > p.Links {
+			p.Links = links
+		}
+		pageLog[url] = p
+		return
+	}
+	pageLog[url] = wmse.Page{URL: url, Depth: depth, ContentType: contentType, Links: links}
+}
 
 // obsPool accumulates request observations from static JS analysis and browser
 // emulation across the whole scan; contract.Infer turns it into endpoint
@@ -266,10 +307,9 @@ func shortSource(raw string) string {
 
 // observedParamNames collects the query keys already reported on links, which
 // the crawler actually saw being requested. It reads the names out of the same
-// rendering the link table prints, so a name cannot be reported as a finding and
-// as a link at the same time: that rendering strips the "?" and folds a value
-// list back to its name, which taking the raw query string did not - so "page"
-// read as "?page" and never matched the parameter it was meant to be skipping.
+// rendering the link table prints, so a name cannot be reported as a finding
+// and as a link at the same time - the rendering strips the "?" and folds a
+// value list back to its name, which taking the raw query string did not.
 func observedParamNames(links []linker.Link) map[string]bool {
 	out := map[string]bool{}
 	for _, l := range links {
@@ -366,6 +406,7 @@ func initEmulationLimits(cfg *config.Config) {
 }
 
 func main() {
+	startedAt := time.Now()
 	cfg := config.Parse()
 	urlgroup.SetGroupStrings(!cfg.NoStringGroup)
 	if cfg.URL == "" {
@@ -468,6 +509,12 @@ func main() {
 			allLinks = append(allLinks, emuLinks...)
 			lastEmuSummary = aggregatedEmuSummary()
 		}
+		// The single-page path has one page, and it is the entry point: depth 0
+		// with whatever the server called it, and everything it holds at depth 1.
+		recordPage(firstNonEmpty(result.URL, cfg.URL), 0, result.Headers.Get("Content-Type"), len(allLinks))
+		for i := range allLinks {
+			allLinks[i].Depth = 1
+		}
 		displayLinks := filterHidden(allLinks, cfg)
 		displayLinks = linker.FoldParamLinks(displayLinks)
 		linker.SortForDisplay(displayLinks)
@@ -478,6 +525,9 @@ func main() {
 			renderContractSection(cfg)
 		}
 		renderFragmentFindings(cfg, displayLinks)
+		if cfg.Output != "" {
+			saveSnapshot(cfg.Output, cfg, allLinks, startedAt)
+		}
 
 		p.IncrementRequest()
 		p.Increment()
@@ -524,6 +574,9 @@ func main() {
 		renderContractSection(cfg)
 	}
 	renderFragmentFindings(cfg, displayLinks)
+	if cfg.Output != "" {
+		saveSnapshot(cfg.Output, cfg, allLinks, startedAt)
+	}
 
 	if cfg.Markdown || cfg.Graphical {
 		g := graph.New(allLinks, cfg.URL)
@@ -1075,6 +1128,13 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 						links = append(links, emuLinks...)
 					}
 				}
+				// Everything found while serving this page sits one level
+				// below it, whichever analyzer found it. The static-explorer
+				// file stores this as the crawl tree, and it is the one thing
+				// link data cannot recover afterwards.
+				for i := range links {
+					links[i].Depth = task.depth + 1
+				}
 				<-sem
 				resultCh <- resultWithTask{task, links, contentType}
 			}
@@ -1111,6 +1171,7 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 		if rt.contentType != "" {
 			contentTypes[rt.task.url] = rt.contentType
 		}
+		recordPage(rt.task.url, rt.task.depth, rt.contentType, len(rt.links))
 
 		for _, link := range rt.links {
 			key := link.HREF
@@ -2041,4 +2102,14 @@ func isJSURL(u string) bool {
 		strings.HasSuffix(lower, ".tsx") ||
 		strings.HasSuffix(lower, ".mts") ||
 		strings.HasSuffix(lower, ".cts")
+}
+
+// firstNonEmpty returns the first non-empty string, or "" if there is none.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

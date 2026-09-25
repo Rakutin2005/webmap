@@ -1,16 +1,23 @@
 BINARY  := webmap
 PKG     := ./cmd/webmap
+EXPLR   := wmse
+EXPLPKG := ./cmd/wmse
 GO      ?= go
 GOFLAGS ?=
 
-.PHONY: all build test vet fmt fmtcheck lint check clean install run
+.PHONY: all build build-explorer test vet fmt fmtcheck lint check clean install run
 
-all: build
+all: build build-explorer
 
 ## build: compile the webmap binary into the repository root
 build:
 	$(GO) build $(GOFLAGS) -o $(BINARY) $(PKG)
 	@echo "Build complete: ./$(BINARY)"
+
+## build-explorer: compile the static explorer, the offline reader for -o files
+build-explorer:
+	$(GO) build $(GOFLAGS) -o $(EXPLR) $(EXPLPKG)
+	@echo "Build complete: ./$(EXPLR)"
 
 ## test: run the full test suite
 test:
@@ -45,7 +52,12 @@ install:
 run: build
 	./$(BINARY) -url "$(URL)"
 
+## save: build, scan, and save a static-explorer file
+##   e.g. make save URL=https://example.com OUT=scan.wmse
+save: build build-explorer
+	./$(BINARY) -url "$(URL)" -o "$(OUT)"
+
 ## clean: remove build artifacts
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) $(EXPLR)
 	$(GO) clean
