@@ -265,15 +265,30 @@ func shortSource(raw string) string {
 }
 
 // observedParamNames collects the query keys already reported on links, which
-// the crawler actually saw being requested.
+// the crawler actually saw being requested. It reads the names out of the same
+// rendering the link table prints, so a name cannot be reported as a finding and
+// as a link at the same time: that rendering strips the "?" and folds a value
+// list back to its name, which taking the raw query string did not - so "page"
+// read as "?page" and never matched the parameter it was meant to be skipping.
 func observedParamNames(links []linker.Link) map[string]bool {
 	out := map[string]bool{}
 	for _, l := range links {
-		for _, p := range l.ParamVariants {
-			for _, part := range strings.Split(p.Query, "&") {
-				if i := strings.Index(part, "="); i > 0 {
-					out[part[:i]] = true
-				}
+		shown := linker.FormatParamVariants(l.ParamVariants)
+		if shown == "" {
+			// A row that says nothing about the queries has not
+			// accounted for any name.
+			continue
+		}
+		for _, part := range strings.Split(shown, "; ") {
+			name := part
+			if i := strings.IndexByte(name, '='); i > 0 {
+				name = name[:i]
+			}
+			if i := strings.IndexByte(name, '+'); i > 0 {
+				name = name[:i]
+			}
+			if name != "" {
+				out[name] = true
 			}
 		}
 	}
@@ -454,9 +469,9 @@ func main() {
 			lastEmuSummary = aggregatedEmuSummary()
 		}
 		displayLinks := filterHidden(allLinks, cfg)
-		displayLinks = groupParamLinks(displayLinks)
-		sortLinks(displayLinks)
-		displayLinks = mergeAPIDetails(displayLinks)
+		displayLinks = linker.FoldParamLinks(displayLinks)
+		linker.SortForDisplay(displayLinks)
+		displayLinks = linker.MergeAPIDetails(displayLinks)
 		displayLinks = applyGrouping(allLinks, displayLinks, cfg)
 		printResults(allLinks, displayLinks, activeGroups, cfg)
 		if cfg.APIContract {
@@ -496,9 +511,9 @@ func main() {
 		lastEmuSummary = aggregatedEmuSummary()
 	}
 	displayLinks := filterHidden(allLinks, cfg)
-	displayLinks = groupParamLinks(displayLinks)
-	sortLinks(displayLinks)
-	displayLinks = mergeAPIDetails(displayLinks)
+	displayLinks = linker.FoldParamLinks(displayLinks)
+	linker.SortForDisplay(displayLinks)
+	displayLinks = linker.MergeAPIDetails(displayLinks)
 	displayLinks = applyGrouping(allLinks, displayLinks, cfg)
 
 	close(progressDone)
@@ -569,53 +584,6 @@ func splitQuery(rawURL string) (base string, query string) {
 func removeQuery(rawURL string) string {
 	base, _ := splitQuery(rawURL)
 	return base
-}
-
-func formatParamVariants(variants []linker.ParamVariant) string {
-	if len(variants) == 0 {
-		return ""
-	}
-	paramValues := make(map[string]map[string]bool)
-	seenQueries := make(map[string]bool)
-	for _, v := range variants {
-		q := v.Query
-		if seenQueries[q] {
-			continue
-		}
-		seenQueries[q] = true
-		q = strings.TrimPrefix(q, "?")
-		pairs := strings.Split(q, "&")
-		for _, pair := range pairs {
-			kv := strings.SplitN(pair, "=", 2)
-			if len(kv) == 2 && kv[0] != "" {
-				if paramValues[kv[0]] == nil {
-					paramValues[kv[0]] = make(map[string]bool)
-				}
-				if kv[1] != "" {
-					paramValues[kv[0]][kv[1]] = true
-				}
-			}
-		}
-	}
-	var parts []string
-	for name, vals := range paramValues {
-		if len(vals) > 0 {
-			valList := make([]string, 0, len(vals))
-			for v := range vals {
-				valList = append(valList, v)
-			}
-			sort.Strings(valList)
-			if len(valList) <= 5 {
-				parts = append(parts, fmt.Sprintf("%s=%s", name, strings.Join(valList, ",")))
-			} else {
-				parts = append(parts, fmt.Sprintf("%s=%s+...", name, strings.Join(valList[:5], ",")))
-			}
-		} else {
-			parts = append(parts, name)
-		}
-	}
-	sort.Strings(parts)
-	return strings.Join(parts, "; ")
 }
 
 // applyGrouping folds discovered URLs into patterns, drops pattern members
@@ -885,63 +853,6 @@ func wrapLine(s string, width int) string {
 	return b.String()
 }
 
-func groupParamLinks(links []linker.Link) []linker.Link {
-	type groupedInfo struct {
-		link     *linker.Link
-		variants []linker.ParamVariant
-		seenBase bool
-	}
-	groups := make(map[string]*groupedInfo)
-	result := make([]linker.Link, 0, len(links))
-
-	for _, l := range links {
-		resolved := l.Resolved
-		if resolved == "" {
-			resolved = l.HREF
-		}
-		base, rawQuery := splitQuery(resolved)
-		groupKey := fmt.Sprintf("%s|%d", base, l.Class)
-
-		if rawQuery == "" {
-			if existing, ok := groups[groupKey]; ok {
-				existing.seenBase = true
-				existing.link.HREF = l.HREF
-				existing.link.Resolved = l.Resolved
-				existing.link.SourceURL = l.SourceURL
-				existing.link.Tag = l.Tag
-				existing.link.APIDetails = l.APIDetails
-			} else {
-				result = append(result, l)
-			}
-			continue
-		}
-
-		if g, ok := groups[groupKey]; ok {
-			g.variants = append(g.variants, linker.ParamVariant{Query: rawQuery})
-			if !g.seenBase {
-				g.link.ParamVariants = g.variants
-			}
-		} else {
-			parent := l
-			parent.HREF = removeQuery(l.HREF)
-			parent.Resolved = base
-			parent.HasParams = false
-			parent.ParamVariants = []linker.ParamVariant{{Query: rawQuery}}
-			groups[groupKey] = &groupedInfo{
-				link:     &parent,
-				variants: []linker.ParamVariant{{Query: rawQuery}},
-			}
-		}
-	}
-
-	for _, g := range groups {
-		g.link.ParamVariants = g.variants
-		result = append(result, *g.link)
-	}
-
-	return result
-}
-
 func enrichLinks(links []linker.Link, f *fetcher.Fetcher) {
 	for i := range links {
 		if links[i].Resolved == "" {
@@ -1075,41 +986,6 @@ func extractDomain(rawURL string) string {
 		return ""
 	}
 	return u.Host
-}
-
-func sortLinks(links []linker.Link) {
-	sort.Slice(links, func(i, j int) bool {
-		if links[i].Class != links[j].Class {
-			return links[i].Class < links[j].Class
-		}
-		if links[i].Category != links[j].Category {
-			return links[i].Category < links[j].Category
-		}
-		if links[i].Domain != links[j].Domain {
-			return links[i].Domain < links[j].Domain
-		}
-		return links[i].HREF < links[j].HREF
-	})
-}
-
-func mergeAPIDetails(links []linker.Link) []linker.Link {
-	byHREF := make(map[string]*linker.Link)
-	result := make([]linker.Link, 0, len(links))
-	for i := range links {
-		key := links[i].HREF
-		if existing, ok := byHREF[key]; ok {
-			if len(links[i].APIDetails) > 0 {
-				existing.APIDetails = append(existing.APIDetails, links[i].APIDetails...)
-			}
-			if len(links[i].ParamVariants) > 0 {
-				existing.ParamVariants = append(existing.ParamVariants, links[i].ParamVariants...)
-			}
-		} else {
-			byHREF[key] = &links[i]
-			result = append(result, links[i])
-		}
-	}
-	return result
 }
 
 func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.ProgressBar, maxWorkers int, requestLimit int, allDomains bool) []linker.Link {
@@ -1421,7 +1297,7 @@ func printPlainResults(allLinks, displayLinks []linker.Link, stats *categorizer.
 
 			paramsInfo := ""
 			if len(link.ParamVariants) > 0 {
-				if p := formatParamVariants(link.ParamVariants); p != "" {
+				if p := linker.FormatParamVariants(link.ParamVariants); p != "" {
 					paramsInfo = " (params: " + p + ")"
 				} else {
 					paramsInfo = " (params)"
@@ -1447,7 +1323,7 @@ func printPlainResults(allLinks, displayLinks []linker.Link, stats *categorizer.
 						continue
 					}
 					seen[key] = true
-					args := cleanArgs(d.Arguments)
+					args := contract.CleanArgs(d.Arguments)
 					if args != "" {
 						fmt.Printf("  %-6s %-18s args: %s%s%s\n", method, link.HREF, args, paramsInfo, classTag)
 					} else {
@@ -1640,7 +1516,7 @@ func printColorResults(allLinks, displayLinks []linker.Link, stats *categorizer.
 
 			paramsInfo := ""
 			if len(link.ParamVariants) > 0 {
-				if p := formatParamVariants(link.ParamVariants); p != "" {
+				if p := linker.FormatParamVariants(link.ParamVariants); p != "" {
 					paramsInfo = " " + color.Colorizef(color.DarkYellow, "(params: %s)", p)
 				} else {
 					paramsInfo = " " + color.Colorizef(color.DarkYellow, "(params)")
@@ -1679,7 +1555,7 @@ func printColorResults(allLinks, displayLinks []linker.Link, stats *categorizer.
 					seen[key] = true
 					methodC := color.Colorizef(color.Cyan, "%-6s", method)
 					hrefC := color.Colorizef(color.Dim, "%-30s", link.HREF)
-					args := cleanArgs(d.Arguments)
+					args := contract.CleanArgs(d.Arguments)
 					if args != "" {
 						argC := color.Colorizef(color.DarkYellow, "args: %s", args)
 						fmt.Printf("  %s %s %s%s%s\n", methodC, hrefC, argC, paramsInfo, classTag)
@@ -1720,21 +1596,6 @@ func printColorResults(allLinks, displayLinks []linker.Link, stats *categorizer.
 	if patternsSection != "" {
 		fmt.Print(patternsSection)
 	}
-}
-
-func cleanArgs(args string) string {
-	args = strings.TrimSpace(args)
-	args = strings.TrimLeft(args, ",")
-	args = strings.TrimSpace(args)
-	args = strings.ReplaceAll(args, "\n", " ")
-	args = strings.ReplaceAll(args, "\r", "")
-	for strings.Contains(args, "  ") {
-		args = strings.ReplaceAll(args, "  ", " ")
-	}
-	if len(args) < 2 || (len(args) < 5 && !strings.ContainsAny(args, "{[/")) {
-		return ""
-	}
-	return truncate(args, 70)
 }
 
 func truncate(s string, max int) string {
