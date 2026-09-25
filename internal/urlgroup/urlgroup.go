@@ -330,7 +330,10 @@ func BuildURLs(raw []string, minCount int) []Group {
 		minCount = 2
 	}
 	segByURL := map[string][]string{}
-	byHost := map[string]map[int][]string{} // host -> segCount -> canonical urls
+	// host -> bucket key -> canonical urls. The bucket key is the first literal
+	// segment plus the path depth, so /complex/*, /developer/* and /static/* are
+	// paired within their own family instead of competing inside one flat list.
+	byHost := map[string]map[string][]string{}
 	for _, r := range raw {
 		canonical, ok := Canonical(r)
 		if !ok {
@@ -345,9 +348,10 @@ func BuildURLs(raw []string, minCount int) []Group {
 		}
 		segByURL[canonical] = segs
 		if byHost[host] == nil {
-			byHost[host] = map[int][]string{}
+			byHost[host] = map[string][]string{}
 		}
-		byHost[host][len(segs)] = append(byHost[host][len(segs)], canonical)
+		key := bucketKey(segs)
+		byHost[host][key] = append(byHost[host][key], canonical)
 	}
 
 	accs := map[string]map[string]bool{}
@@ -401,6 +405,21 @@ func BuildURLs(raw []string, minCount int) []Group {
 }
 
 const maskSep = "\x1f"
+
+// bucketKey groups sibling paths that can actually form a pattern together:
+// the path depth plus the first literal segment. Keeping /complex/* apart
+// from /static/* stops one huge bucket from crowding the others out and makes
+// the resulting patterns meaningful ("/complex/{id}", not "/{a}/{b}").
+// A first segment that is itself a typed identifier (int/uuid/hash/base64)
+// belongs to the variable space, so those bucket by depth alone.
+func bucketKey(segs []string) string {
+	first := segs[0]
+	switch segmentKind(first) {
+	case constKInt, constUUUID, constHash, constBase64:
+		first = ""
+	}
+	return strconv.Itoa(len(segs)) + maskSep + first
+}
 
 // maskKey builds a comparable string key from a host and a masked segment
 // shape ("" marks a variable position).

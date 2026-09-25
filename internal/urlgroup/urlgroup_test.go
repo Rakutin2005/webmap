@@ -1,6 +1,7 @@
 package urlgroup
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -310,5 +311,23 @@ func TestVarRangeNonNumeric(t *testing.T) {
 	}
 	if strings.Contains(got, "…") {
 		t.Fatalf("unexpected truncation marker, got %q", got)
+	}
+}
+
+// Regression: sibling families must be paired within their own bucket. A huge
+// /static/* family used to fill the shared two-segment bucket and crowd
+// /complex/* out of the pairing window, so those never became a pattern.
+func TestLargeBucketDoesNotStarveSiblings(t *testing.T) {
+	raw := make([]string, 0, maxBucketLen+64)
+	for i := 0; i < maxBucketLen+500; i++ {
+		raw = append(raw, fmt.Sprintf("https://h/static/asset%d.png", i))
+	}
+	for i := 0; i < 62; i++ {
+		raw = append(raw, fmt.Sprintf("https://h/complex/%d", 4200+i))
+	}
+	groups := BuildURLs(raw, 2)
+	g := findByPattern(t, groups, "https://h/complex/{id: int}")
+	if g.Count != 62 {
+		t.Fatalf("expected all 62 complex members, got %d", g.Count)
 	}
 }
