@@ -45,6 +45,9 @@ type Observation struct {
 	// EndpointOnly marks an endpoint path found in the code without a
 	// resolvable request around it: no method, parameters or calls are known.
 	EndpointOnly bool
+	// MethodInferred marks a verb that was derived from the call shape rather
+	// than stated by the code, so the contract can label it as a guess.
+	MethodInferred bool
 }
 
 // ResponseField is one field path read off an endpoint's response, with the
@@ -87,6 +90,9 @@ type Endpoint struct {
 	// Unobserved marks an endpoint that was only seen as a path in the code:
 	// no request was resolved, so method/params/calls are unknown.
 	Unobserved bool
+	// MethodInferred means every captured verb for this endpoint was derived
+	// from the call shape, not stated by the code.
+	MethodInferred bool
 	// Raw holds one masked rendition per unique request (context/evidence).
 	Raw []string
 }
@@ -185,6 +191,12 @@ func Infer(obs []Observation) []Endpoint {
 		} else {
 			e.Methods = addString(e.Methods, strings.ToUpper(o.Method))
 			e.Calls++
+			if o.MethodInferred {
+				e.MethodInferred = true
+			} else {
+				// A proven verb anywhere makes the endpoint's method known.
+				e.MethodInferred = false
+			}
 		}
 		for _, h := range o.Headers {
 			e.Headers = addHeader(e.Headers, h)
@@ -828,6 +840,8 @@ func render(eps []Endpoint, raw bool, col bool) string {
 			}
 			if e.Unobserved {
 				b.WriteString(paint(col, color.DarkGray, " (unobserved)"))
+			} else if e.MethodInferred {
+				b.WriteString(paint(col, color.DarkYellow, " (inferred from call shape)"))
 			}
 		}
 		b.WriteString("\n")

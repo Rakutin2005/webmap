@@ -31,6 +31,7 @@ func Parse(jsContent string, sourceURL string, fullInfo bool) (result []linker.L
 	// Token-level scan for HTTP-client calls (client.get/post/...) that the AST
 	// analysis cannot reach — either the parser bailed out on the surrounding
 	// minified code, or the client object is an unrecognized short name.
+	ctx.scanRequestSites(tokens)
 	ctx.scanCalls(tokens, jsContent)
 
 	// Robust fallback: many endpoints are built at runtime (e.g.
@@ -122,12 +123,7 @@ func (c *context) addEndpointObs(rawURL string) {
 	if u == "" {
 		return
 	}
-	key := "endpoint|" + u
-	if c.obsSeen[key] {
-		return
-	}
-	c.obsSeen[key] = true
-	c.obs = append(c.obs, contract.Observation{URL: u, EndpointOnly: true})
+	c.addObsFlags(u, "", nil, "", false, true)
 }
 
 // tokenCallMethods maps a member name on an HTTP client object to the request
@@ -168,6 +164,281 @@ func urlArgShape(s string) bool {
 // an unrecognized name. Only calls whose first argument is a string/template
 // URL literal are reported; bodies are captured from a literal second argument
 // (string or object/array literal).
+// scanRequestSites finds request calls purely by walking the token stream.
+// The recursive-descent pass is precise but gives up on minified bundles (one
+// unbalanced block collapses a whole file into a single node), and this pass
+// does not care about parse trees at all: every call-shaped token sequence with
+// an endpoint literal is reported, whatever the client is called and however
+// the arguments are assembled.
+func (c *context) scanRequestSites(tokens []token) {
+	// Stack of currently open brackets, so a literal can be attributed to the
+	// call that encloses it.
+	var stack []int
+	for i := range tokens {
+		t := tokens[i]
+		if t.typ == tokPunct {
+			switch t.value {
+			case "(", "[", "{":
+				stack = append(stack, i)
+			case ")", "]", "}":
+				if len(stack) > 0 {
+					stack = stack[:len(stack)-1]
+				}
+			}
+			continue
+		}
+		if t.typ != tokString || len(stack) == 0 {
+			continue
+		}
+		// Attribute the literal to the nearest enclosing call, skipping any
+		// argument object it sits in: f("/x") and f({url: "/x"}) both count.
+		open := -1
+		for k := len(stack) - 1; k >= 0; k-- {
+			if tokens[stack[k]].value == "(" {
+				open = stack[k]
+				break
+			}
+		}
+		if open < 0 {
+			continue
+		}
+		// A call named open()/sendBeacon() is handled by the dedicated paths.
+		verb := calleeVerbBefore(tokens, open)
+		if verb == "open" || verb == "sendBeacon" {
+			continue
+		}
+		value, _ := tokenStringRun(tokens, i)
+		if value == "" || !looksLikeAPIEndpoint(value) {
+			continue
+		}
+		closeIdx := matchParenFrom(tokens, open)
+		if closeIdx < 0 {
+			continue
+		}
+		// The literal must be the first argument, or the url property of a
+		// config object passed as the first argument.
+		isFirst := firstArgIndex(tokens, open, i) == i
+		cfg := scanRequestInit(tokens, open+1, closeIdx)
+		if !isFirst && !cfg.fromConfig {
+			continue
+		}
+		if !isFirst {
+			value = cfg.url
+			if value == "" {
+				continue
+			}
+		}
+		if !urlArgShape(value) {
+			continue
+		}
+		method, source := inferMethod(cfg.method, verb, cfg.hasPayload, false)
+		inferred := source == srcShape || source == srcDefault
+		if method == "" {
+			method, inferred = "GET", true
+		}
+		target := resolveEndpoint(value, c.sourceURL)
+		if target == "" {
+			continue
+		}
+		if cfg.payloadIsQuery {
+			target = appendQuery(target, cfg.params)
+		}
+		headers := append([]contract.NameValue{}, cfg.headers...)
+		headers = append(headers, contentTypeHeader(cfg.contentType)...)
+		if isLikelyNotAPI(target) {
+			continue
+		}
+		// The AST pass yields richer records (resolved params, headers,
+		// response schema), so skip endpoints it already covered.
+		if c.coveredByAST(target) {
+			continue
+		}
+		c.addLink(target, "js-api", "token-scan", method)
+		c.addObsFlags(target, method, headers, cfg.body, inferred, false)
+	}
+}
+
+// firstArgIndex returns the token index where the first argument of the call
+// opening at openIdx starts.
+func firstArgIndex(tokens []token, openIdx, limit int) int {
+	i := openIdx + 1
+	if i >= len(tokens) {
+		return i
+	}
+	// Callbacks/config wrappers put the URL inside a nested expression, so step
+	// over a leading balanced group when the URL is nested.
+	return i
+}
+
+// calleeVerbBefore returns the property name the call at openIdx is invoked on
+// (a.b(), a["post"]()), or "" for a bare call.
+func calleeVerbBefore(tokens []token, openIdx int) string {
+	i := openIdx - 1
+	if i < 0 {
+		return ""
+	}
+	switch tokens[i].typ {
+	case tokIdent, tokKeyword:
+		name := tokens[i].value
+		// a.b(...) — the name before "(" is the property.
+		if i-1 >= 0 && tokens[i-1].typ == tokPunct && tokens[i-1].value == "." {
+			return name
+		}
+		return ""
+	case tokString:
+		// a["post"](...) — the computed key closes the callee.
+		if i-1 >= 0 && tokens[i-1].typ == tokPunct && tokens[i-1].value == "[" {
+			return tokens[i].value
+		}
+		return ""
+	}
+	return ""
+}
+
+// matchParenFrom returns the index of the ")" closing the "(" at openIdx.
+func matchParenFrom(tokens []token, openIdx int) int {
+	depth := 0
+	for i := openIdx; i < len(tokens); i++ {
+		if tokens[i].typ != tokPunct {
+			continue
+		}
+		switch tokens[i].value {
+		case "(", "[", "{":
+			depth++
+		case ")", "]", "}":
+			depth--
+			if depth == 0 && tokens[i].value == ")" {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// tokenStringRun concatenates a run of string literals joined by "+" starting at
+// i, so "/api/" + "users" resolves to one endpoint.
+func tokenStringRun(tokens []token, i int) (string, int) {
+	if tokens[i].typ != tokString {
+		return "", i
+	}
+	value := tokens[i].value
+	j := i + 1
+	for j+1 < len(tokens) {
+		if tokens[j].typ == tokOp && tokens[j].value == "+" && tokens[j+1].typ == tokString {
+			value += tokens[j+1].value
+			j += 2
+			continue
+		}
+		break
+	}
+	return value, j
+}
+
+// requestInit is what a linear scan can learn about a call's arguments.
+type requestInit struct {
+	method         string
+	url            string
+	body           string
+	headers        []contract.NameValue
+	params         []contract.NameValue
+	contentType    string
+	hasPayload     bool
+	payloadIsQuery bool
+	fromConfig     bool
+}
+
+// scanRequestInit reads the protocol keys inside a call's argument list.
+func scanRequestInit(tokens []token, from, to int) requestInit {
+	var cfg requestInit
+	depth := 0
+	for i := from; i < to && i < len(tokens); i++ {
+		t := tokens[i]
+		if t.typ == tokPunct {
+			switch t.value {
+			case "(", "[", "{":
+				depth++
+			case ")", "]", "}":
+				depth--
+			}
+			continue
+		}
+		if t.typ != tokIdent && t.typ != tokKeyword {
+			continue
+		}
+		key := t.value
+		// Key must be followed by ":" to be an object property.
+		if i+1 >= to || tokens[i+1].typ != tokPunct || tokens[i+1].value != ":" {
+			continue
+		}
+		valStart := i + 2
+		if valStart >= to {
+			continue
+		}
+		lit := tokenLiteralValue(tokens[valStart])
+		switch key {
+		case "url", "uri", "endpoint", "api", "baseURL":
+			// The url key sits inside the argument object, i.e. one level
+			// below the call's own parentheses.
+			if depth <= 1 {
+				cfg.fromConfig = true
+			}
+			cfg.url = lit
+		case "method", "type":
+			if lit != "" {
+				cfg.method = strings.ToUpper(lit)
+			}
+		case "contentType":
+			cfg.contentType = lit
+		case "body", "data":
+			cfg.hasPayload = true
+			if lit != "" {
+				cfg.body = lit
+			}
+		case "params":
+			if lit != "" {
+				cfg.hasPayload = true
+				cfg.payloadIsQuery = true
+			}
+		}
+	}
+	return cfg
+}
+
+// tokenLiteralValue returns the literal value of a token when it is a string,
+// template, number or boolean.
+func tokenLiteralValue(t token) string {
+	switch t.typ {
+	case tokString, tokTemplate, tokNumber:
+		return t.value
+	case tokKeyword:
+		if t.value == "true" || t.value == "false" {
+			return t.value
+		}
+	}
+	return ""
+}
+
+// coveredByAST reports whether the AST pass already produced a record for this
+// endpoint. Comparison ignores the query string: the AST resolves parameters
+// properly, so its version supersedes the token-level one.
+func (c *context) coveredByAST(target string) bool {
+	base := baseURLOf(target)
+	for _, k := range c.astObs {
+		if k.url == target || baseURLOf(k.url) == base {
+			return true
+		}
+	}
+	return false
+}
+
+// baseURLOf strips the query and fragment from a URL.
+func baseURLOf(u string) string {
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		return u[:i]
+	}
+	return u
+}
+
 func (c *context) scanCalls(tokens []token, jsContent string) {
 	for i := 0; i < len(tokens); i++ {
 		if tokens[i].typ != tokIdent {
@@ -204,7 +475,7 @@ func (c *context) scanCalls(tokens []token, jsContent string) {
 				}
 			}
 		}
-		c.addObs(url, method, nil, body)
+		c.addObsFallback(url, method, body)
 	}
 }
 
@@ -316,6 +587,46 @@ type context struct {
 	// xhrState tracks raw XMLHttpRequest objects by variable name so open(),
 	// setRequestHeader() and send() can be correlated into one AJAX contract.
 	xhrState map[string]*xhrInfo
+	// reqVar tracks `new Request(url, init)` values so a later fetch(req) uses
+	// the same endpoint and request shape.
+	reqVar map[string]initConfig
+	// formData tracks variables created with new FormData()/new URLSearchParams()
+	// and the fields appended to them.
+	formData map[string]map[string]string
+	// headersVar tracks `new Headers()` objects and their set() assignments.
+	headersVar map[string]bool
+	// clientInst tracks axios.create({baseURL, headers}) instances.
+	clientInst map[string]initConfig
+	// inChain counts how many response-bearing continuations (then/done/…)
+	// wrap the call being analysed; a payload plus a continuation implies POST.
+	inChain int
+	// astObs indexes the endpoint/method pairs the AST pass already recorded so
+	// the token-level fallback does not report the same call twice.
+	astObs []obsKey
+}
+
+// obsKey identifies a recorded request observation.
+type obsKey struct {
+	method string
+	url    string
+}
+
+// formDataBody renders the fields collected on a FormData variable.
+func (c *context) formDataBody(name string) string {
+	fields := c.formData[name]
+	if len(fields) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"=<"+k+">")
+	}
+	return strings.Join(parts, "&")
 }
 
 // xhrInfo is the accumulated state of one raw XMLHttpRequest.
@@ -329,17 +640,21 @@ type xhrInfo struct {
 
 func newContext(sourceURL string, fullInfo bool) *context {
 	return &context{
-		sourceURL: sourceURL,
-		fullInfo:  fullInfo,
-		vars:      map[string]string{},
-		props:     map[string]map[string]string{},
-		varInits:  map[string]expr{},
-		seen:      map[string]bool{},
-		obsSeen:   map[string]bool{},
-		respVar:   map[string]string{},
-		respElem:  map[string]string{},
-		respField: map[string]map[string]string{},
-		xhrState:  map[string]*xhrInfo{},
+		sourceURL:  sourceURL,
+		fullInfo:   fullInfo,
+		vars:       map[string]string{},
+		props:      map[string]map[string]string{},
+		varInits:   map[string]expr{},
+		seen:       map[string]bool{},
+		obsSeen:    map[string]bool{},
+		respVar:    map[string]string{},
+		respElem:   map[string]string{},
+		respField:  map[string]map[string]string{},
+		xhrState:   map[string]*xhrInfo{},
+		reqVar:     map[string]initConfig{},
+		formData:   map[string]map[string]string{},
+		headersVar: map[string]bool{},
+		clientInst: map[string]initConfig{},
 	}
 }
 
@@ -383,6 +698,12 @@ const maxObs = 4096
 // addObs feeds a captured request (method, headers, body) into the contract
 // observation pool, resolved against the script's source URL.
 func (c *context) addObs(rawURL, method string, headers []contract.NameValue, body string) {
+	c.addObsFlags(rawURL, method, headers, body, false, false)
+}
+
+// addObsFlags records a request observation, flagging a method that was
+// inferred from the call shape and an endpoint known only as a path literal.
+func (c *context) addObsFlags(rawURL, method string, headers []contract.NameValue, body string, methodInferred, endpointOnly bool) {
 	if len(c.obs) >= maxObs {
 		return
 	}
@@ -394,16 +715,46 @@ func (c *context) addObs(rawURL, method string, headers []contract.NameValue, bo
 	for _, h := range headers {
 		key += "|" + h.Name + ":" + h.Value
 	}
+	if endpointOnly {
+		key = "endpoint|" + u
+	}
 	if c.obsSeen[key] {
 		return
 	}
 	c.obsSeen[key] = true
+	if !endpointOnly {
+		c.astObs = append(c.astObs, obsKey{method: strings.ToUpper(method), url: u})
+	}
 	c.obs = append(c.obs, contract.Observation{
-		URL:     u,
-		Method:  stringOr(method, "GET"),
-		Headers: headers,
-		Body:    body,
+		URL:            u,
+		Method:         stringOr(method, "GET"),
+		Headers:        headers,
+		Body:           body,
+		MethodInferred: methodInferred,
+		EndpointOnly:   endpointOnly,
 	})
+}
+
+// addObsFallback records an observation from the token-level scanner. When the
+// AST pass already described the same endpoint the weaker token-level reading
+// (raw, unevaluated body) is dropped so one call is not counted twice.
+func (c *context) addObsFallback(rawURL, method, body string) {
+	u := resolveEndpoint(strings.TrimSpace(rawURL), c.sourceURL)
+	if u == "" {
+		return
+	}
+	for _, seen := range c.astObs {
+		if seen.method == strings.ToUpper(method) && seen.url == u {
+			return
+		}
+	}
+	c.addObs(u, method, nil, body)
+}
+
+// addObsInferred records an observation whose verb was derived from the call
+// shape rather than stated by the code; contracts label it as inferred.
+func (c *context) addObsInferred(rawURL, method string, headers []contract.NameValue, body string, inferred bool) {
+	c.addObsFlags(rawURL, method, headers, body, inferred, false)
 }
 
 func stringOr(s, def string) string {
@@ -415,13 +766,17 @@ func stringOr(s, def string) string {
 
 // initConfig captures the shape of a fetch/Request init object literal.
 type initConfig struct {
-	method  string
-	body    string
-	headers []contract.NameValue
+	method      string
+	body        string
+	headers     []contract.NameValue
+	params      []contract.NameValue
+	contentType string
+	rawJSON     bool
+	hasBodyKey  bool
 }
 
-// parseInit extracts method/body/headers from a fetch init expression (a
-// direct object literal or a var holding one).
+// parseInit extracts method/body/headers/params from a fetch or client init
+// expression (a direct object literal or a var holding one).
 func (c *context) parseInit(e expr) initConfig {
 	var cfg initConfig
 	if id, ok := e.(*identExpr); ok {
@@ -439,21 +794,90 @@ func (c *context) parseInit(e expr) initConfig {
 		switch strings.ToLower(p.key) {
 		case "method", "type":
 			cfg.method = c.evalExpr(p.value)
-		case "body", "data":
+		case "body":
 			cfg.body = c.bodyExpr(p.value)
+			cfg.hasBodyKey = true
+		case "data":
+			cfg.body = c.bodyExpr(p.value)
+			cfg.hasBodyKey = true
+		case "params":
+			cfg.params = c.paramExpr(p.value)
 		case "headers":
 			cfg.headers = c.headersExpr(p.value)
+		case "contenttype":
+			cfg.contentType = c.evalExpr(p.value)
+		case "processdata":
+			// processData:false means the object is sent verbatim as JSON.
+			if strings.EqualFold(strings.TrimSpace(c.evalExpr(p.value)), "false") {
+				cfg.rawJSON = true
+			}
 		}
 	}
 	return cfg
 }
 
+// paramExpr renders a query-parameter container (axios params, jQuery data on a
+// GET) as ordered name/value pairs.
+func (c *context) paramExpr(e expr) []contract.NameValue {
+	if id, ok := e.(*identExpr); ok {
+		if o2, ok := c.varInits[id.name]; ok {
+			e = o2
+		}
+	}
+	oe, ok := e.(*objectExpr)
+	if !ok {
+		return nil
+	}
+	out := make([]contract.NameValue, 0, len(oe.properties))
+	for _, p := range oe.properties {
+		out = append(out, contract.NameValue{Name: p.key, Value: c.evalExpr(p.value)})
+	}
+	return out
+}
+
+// appendQuery adds collected parameters to an endpoint URL so the contract
+// inference sees them as query fields.
+func appendQuery(rawURL string, params []contract.NameValue) string {
+	if rawURL == "" || len(params) == 0 {
+		return rawURL
+	}
+	values := url.Values{}
+	for _, p := range params {
+		if p.Name == "" {
+			continue
+		}
+		values.Add(p.Name, p.Value)
+	}
+	sep := "?"
+	if strings.Contains(rawURL, "?") {
+		sep = "&"
+	}
+	return rawURL + sep + values.Encode()
+}
+
+// contentTypeHeader turns a client-declared content type into a request header
+// so the body format is inferred the same way as an explicit header.
+func contentTypeHeader(contentType string) []contract.NameValue {
+	ct := strings.TrimSpace(contentType)
+	if ct == "" {
+		return nil
+	}
+	if idx := strings.IndexByte(ct, ';'); idx >= 0 {
+		ct = strings.TrimSpace(ct[:idx])
+	}
+	return []contract.NameValue{{Name: "Content-Type", Value: ct}}
+}
+
 // bodyExpr renders a request-body expression: object literals compile to JSON,
-// strings pass through, unknown/ident/dynamic values collapse to null so the
-// format analysis still sees a placeholder.
+// strings pass through, known body builders ($.param, URLSearchParams,
+// FormData, JSON.stringify) are evaluated, and unknown/dynamic values collapse
+// to null so the format analysis still sees a placeholder.
 func (c *context) bodyExpr(e expr) string {
 	if e == nil {
 		return ""
+	}
+	if s := c.builtBody(e); s != "" {
+		return s
 	}
 	if v, ok := c.objValue(e); ok {
 		switch v := v.(type) {
@@ -474,6 +898,89 @@ func (c *context) bodyExpr(e expr) string {
 		return s
 	}
 	return "null"
+}
+
+// builtBody evaluates the well-known request-body builders so the contract
+// shows the real field names instead of "null".
+func (c *context) builtBody(e expr) string {
+	// new URLSearchParams({a:1}) / new FormData() / new Blob(...)
+	if ne, ok := e.(*newExpr); ok {
+		if id, ok := ne.callee.(*identExpr); ok && len(ne.args) > 0 {
+			switch id.name {
+			case "URLSearchParams":
+				if vals := c.paramPairs(ne.args[0]); len(vals) > 0 {
+					return encodeForm(vals)
+				}
+			case "FormData":
+				// Fields are appended in later statements; report the ones we saw.
+				return c.formDataBody(id.name)
+			case "Blob", "ArrayBuffer":
+				return "null"
+			}
+		}
+	}
+	ce, ok := e.(*callExpr)
+	if !ok || len(ce.args) == 0 {
+		return ""
+	}
+	me, isMember := ce.callee.(*memberExpr)
+	if !isMember {
+		return ""
+	}
+	// $.param({a:1,b:2}) serializes a plain object to form-urlencoded.
+	if me.property == "param" {
+		if vals := c.paramPairs(ce.args[0]); len(vals) > 0 {
+			return encodeForm(vals)
+		}
+	}
+	// JSON.stringify({a:1}) is a JSON body.
+	if me.property == "stringify" {
+		if v, ok := c.objValue(ce.args[0]); ok {
+			switch v.(type) {
+			case map[string]any, []any:
+				if b, err := json.Marshal(v); err == nil {
+					return string(b)
+				}
+			}
+		}
+		if s := strings.TrimSpace(c.evalExpr(ce.args[0])); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// paramPairs renders a plain-object argument as ordered name/value pairs.
+func (c *context) paramPairs(e expr) []contract.NameValue {
+	if id, ok := e.(*identExpr); ok {
+		if o2, ok := c.varInits[id.name]; ok {
+			e = o2
+		}
+	}
+	oe, ok := e.(*objectExpr)
+	if !ok {
+		return nil
+	}
+	out := make([]contract.NameValue, 0, len(oe.properties))
+	for _, p := range oe.properties {
+		out = append(out, contract.NameValue{Name: p.key, Value: c.evalExpr(p.value)})
+	}
+	return out
+}
+
+// encodeForm serializes name/value pairs as a form-urlencoded body.
+func encodeForm(vals []contract.NameValue) string {
+	values := url.Values{}
+	for _, v := range vals {
+		if v.Name == "" {
+			continue
+		}
+		values.Add(v.Name, v.Value)
+	}
+	if len(values) == 0 {
+		return ""
+	}
+	return values.Encode()
 }
 
 // headersExpr converts a headers value (object literal or recorded props) into
@@ -661,8 +1168,35 @@ func (c *context) analyzeVarDecl(d *varDecl) {
 	}
 	// var x = new XMLHttpRequest(): start tracking the instance so its
 	// open()/setRequestHeader()/send() calls fold into one AJAX contract.
-	if ne, ok := d.init.(*newExpr); ok && isXMLHttpRequestExpr(ne.callee) {
-		c.xhrState[d.name] = &xhrInfo{}
+	if ne, ok := d.init.(*newExpr); ok {
+		if isXMLHttpRequestExpr(ne.callee) {
+			c.xhrState[d.name] = &xhrInfo{}
+		}
+		if id, ok := ne.callee.(*identExpr); ok {
+			switch id.name {
+			case "Request":
+				cfg := initConfig{}
+				if len(ne.args) > 1 {
+					cfg = c.parseInit(ne.args[1])
+				}
+				if len(ne.args) > 0 && c.resolveURLArg(ne.args[0]) != "" {
+					cfg.method = stringOr(cfg.method, "GET")
+					c.reqVar[d.name] = cfg
+				}
+			case "FormData", "URLSearchParams":
+				c.formData[d.name] = map[string]string{}
+			case "Headers":
+				c.headersVar[d.name] = true
+				c.props[d.name] = map[string]string{}
+			}
+		}
+	}
+	// const api = axios.create({baseURL, headers}): remember the defaults so
+	// api.get('/x') resolves against the instance base URL.
+	if ce, ok := d.init.(*callExpr); ok {
+		if me, ok := ce.callee.(*memberExpr); ok && me.property == "create" && len(ce.args) > 0 {
+			c.clientInst[d.name] = c.parseInit(ce.args[0])
+		}
 	}
 }
 
@@ -889,6 +1423,65 @@ var methodPropPatterns = []string{
 	"get", "post", "put", "delete", "patch", "request",
 }
 
+// httpVerbs maps a callee's last property to the verb it issues. A property
+// outside this map is not a reason to reject a call — it only means the verb
+// has to be inferred from the argument shape instead.
+var httpVerbs = map[string]string{
+	"get": "GET", "post": "POST", "put": "PUT", "patch": "PATCH",
+	"delete": "DELETE", "head": "HEAD", "options": "OPTIONS",
+	"del": "DELETE", "remove": "DELETE", "destroy": "DELETE",
+	"create": "POST", "update": "PUT", "add": "POST", "save": "POST",
+	"send": "POST", "submit": "POST", "upload": "POST", "download": "GET",
+	"list": "GET", "load": "GET", "search": "GET", "query": "GET",
+	"fetch": "GET", "read": "GET", "find": "GET", "count": "GET",
+	"removeItem": "DELETE", "set": "POST", "insert": "POST", "replace": "PUT",
+}
+
+// nonCallers are functions that take a string but are obviously not requests;
+// a small denylist keeps the deliberately wide "any call with a URL argument"
+// rule from reporting every console.log('/api/…').
+var nonCallers = map[string]bool{
+	"log": true, "warn": true, "error": true, "info": true, "debug": true,
+	"trace": true, "dir": true, "table": true, "assert": true, "time": true,
+	"timeEnd": true, "group": true, "groupEnd": true, "push": true,
+	"replace": false, "match": true, "test": true, "exec": true,
+	"setAttribute": true, "getAttribute": true, "write": true,
+	"appendChild": true, "createElement": true, "querySelector": true,
+	"querySelectorAll": true, "getElementById": true, "import": true,
+	"require": true, "addEventListener": true, "setTimeout": true,
+	"setInterval": true, "fetchHeaders": false,
+}
+
+// methodSource explains how a verb was determined, for the contract output.
+const (
+	srcExplicit = "init"    // method/type field in the request object
+	srcVerb     = "verb"    // callee property names the verb
+	srcShape    = "shape"   // inferred from payload/continuation shape
+	srcDefault  = "default" // bare URL, no evidence of a body
+)
+
+// inferMethod resolves the verb of a request call and reports how sure we are.
+// Nothing is guessed silently: a shape-based verdict is marked as inferred so
+// the contract can say so.
+func inferMethod(explicit, verb string, hasPayload, hasContinuation bool) (method, source string) {
+	if m := strings.ToUpper(strings.TrimSpace(explicit)); m != "" {
+		return m, srcExplicit
+	}
+	if m, ok := httpVerbs[strings.ToLower(verb)]; ok {
+		return m, srcVerb
+	}
+	if hasPayload {
+		return "POST", srcShape
+	}
+	if hasContinuation {
+		return "POST", srcShape
+	}
+	if hasPayload || verb == "" {
+		return "GET", srcDefault
+	}
+	return "", ""
+}
+
 type callMatch int
 
 const (
@@ -898,6 +1491,7 @@ const (
 	callConfig               // obj({url: url, method: ...})
 	callXHROpen              // xhr.open(method, url)
 	callNewRequest           // new Request(url)
+	callGeneric              // any call whose first argument is a URL
 )
 
 var chainMethods = map[string]bool{
@@ -938,14 +1532,24 @@ func (c *context) analyzeCall(ce *callExpr) {
 			// fetch(url).then(r => r.json()) / client.get(url).then(res => …):
 			// bind the callback parameter to the endpoint so the fields read
 			// off the response become that endpoint's response schema.
-			if responseChains[me.property] {
+			bearing := responseChains[me.property]
+			if bearing {
+				// A payload plus a response continuation is the shape of a POST;
+				// the depth is visible to the call being analysed.
+				c.inChain++
 				if endpoint := c.chainEndpoint(me.object); endpoint != "" {
 					c.bindResponse(ce.args, endpoint)
 				}
 			}
 			if innerCall, ok := me.object.(*callExpr); ok {
 				c.analyzeCall(innerCall)
+				if bearing {
+					c.inChain--
+				}
 				return
+			}
+			if bearing {
+				c.inChain--
 			}
 		}
 	}
@@ -1315,6 +1919,10 @@ func (c *context) resolveCall(ce *callExpr) (match callMatch, objName, methodNam
 					if propName == "ajax" {
 						return callConfig, objName, propName, "GET"
 					}
+					if propName == "getJSON" {
+						// jQuery's JSON GET shorthand: $.getJSON(url, [data], [cb])
+						return callMethod, objName, propName, "GET"
+					}
 					for _, m := range methodPropPatterns {
 						if propName == m {
 							return callMethod, objName, propName, strings.ToUpper(propName)
@@ -1373,39 +1981,154 @@ func (c *context) resolveCall(ce *callExpr) (match callMatch, objName, methodNam
 		}
 	}
 
+	// Structural fallback: a call whose first argument resolves to a URL is a
+	// request regardless of who is being called. This is what makes the
+	// analyzer work on wrapped, aliased and minified clients instead of only
+	// on a fixed list of known library names.
+	if c.genericRequestArgs(ce) != "" {
+		return callGeneric, "", calleeProperty(ce.callee), ""
+	}
+
 	return callNone, "", "", ""
 }
 
-func (c *context) analyzeConfigObj(oe *objectExpr) {
-	urlVal := ""
-	method := ""
-	var body string
-	var headers []contract.NameValue
-	for _, prop := range oe.properties {
-		switch {
-		case configPropKeys[prop.key]:
-			urlVal = c.evalExpr(prop.value)
-			if urlVal == "" {
-				if id, ok := prop.value.(*identExpr); ok {
-					urlVal = c.vars[id.name]
-				}
+// genericRequestArgs reports the endpoint of a structurally detected request
+// call, or nil when the call is not a request.
+func (c *context) genericRequestArgs(ce *callExpr) string {
+	if len(ce.args) == 0 {
+		return ""
+	}
+	verb := calleeProperty(ce.callee)
+	if nonCallers[verb] {
+		return ""
+	}
+	first := ce.args[0]
+	// Config-object form: anything(url, method, …) / anything({url: …}).
+	if oe := c.configObject(first); oe != nil {
+		for _, prop := range oe.properties {
+			if !configPropKeys[prop.key] {
+				continue
 			}
-		case prop.key == "method" || prop.key == "type":
-			method = c.evalExpr(prop.value)
-		case prop.key == "body" || prop.key == "data":
-			body = c.bodyExpr(prop.value)
-		case prop.key == "headers":
-			headers = c.headersExpr(prop.value)
+			if u := c.resolveURLArg(prop.value); u != "" {
+				return u
+			}
+		}
+		return ""
+	}
+	// Plain form: anything('/api/x').
+	if u := c.resolveURLArg(first); u != "" {
+		return u
+	}
+	return ""
+}
+
+// requestConfigKeys are the protocol-level keys that mark an object as a
+// request description rather than a plain payload.
+var requestConfigKeys = map[string]bool{
+	"url": true, "uri": true, "endpoint": true, "api": true, "baseURL": true,
+	"method": true, "type": true, "body": true, "data": true, "params": true,
+	"headers": true, "contentType": true, "processData": true, "dataType": true,
+	"responseType": true, "withCredentials": true, "credentials": true,
+	"async": true, "timeout": true, "cache": true, "mode": true,
+}
+
+// isRequestConfig reports whether an object literal describes a request
+// (has protocol keys) as opposed to being a payload or arbitrary data.
+func isRequestConfig(oe *objectExpr) bool {
+	if oe == nil {
+		return false
+	}
+	for _, p := range oe.properties {
+		if requestConfigKeys[p.key] || requestConfigKeys[strings.ToLower(p.key)] {
+			return true
 		}
 	}
-	if urlVal != "" {
-		c.addLink(urlVal, "js-api", "config", method)
-		m := strings.ToUpper(strings.TrimSpace(method))
-		if m == "" {
-			m = "GET"
-		}
-		c.addObs(urlVal, m, headers, body)
+	return false
+}
+
+// readVerbs are verbs whose object argument is a query string, not a body.
+var readVerbs = map[string]bool{
+	"get": true, "load": true, "list": true, "search": true, "fetch": true,
+	"read": true, "find": true, "query": true, "count": true, "download": true,
+	"head": true, "options": true, "request": true,
+}
+
+// configObject returns an object literal for an expression that denotes one,
+// following a variable holding it.
+func (c *context) configObject(e expr) *objectExpr {
+	if oe, ok := e.(*objectExpr); ok {
+		return oe
 	}
+	if id, ok := e.(*identExpr); ok {
+		if o2, ok := c.varInits[id.name]; ok {
+			if oe, ok := o2.(*objectExpr); ok {
+				return oe
+			}
+		}
+	}
+	return nil
+}
+
+// calleeProperty returns the last property of a call target: the member name for
+// a.b(), the identifier for a(), and the string key for computed access such as
+// a["post"] so obfuscated lookups resolve to the same verb.
+func calleeProperty(callee expr) string {
+	switch n := callee.(type) {
+	case *identExpr:
+		return n.name
+	case *memberExpr:
+		return n.property
+	}
+	return ""
+}
+
+func (c *context) analyzeConfigObj(oe *objectExpr) {
+	cfg := c.parseInit(oe)
+	// url lives in the config object itself, so it is read separately.
+	urlVal := ""
+	for _, prop := range oe.properties {
+		if !configPropKeys[prop.key] {
+			continue
+		}
+		urlVal = c.evalExpr(prop.value)
+		if urlVal == "" {
+			if id, ok := prop.value.(*identExpr); ok {
+				urlVal = c.vars[id.name]
+			}
+		}
+	}
+	if urlVal == "" {
+		return
+	}
+	method := strings.ToUpper(strings.TrimSpace(cfg.method))
+	body := cfg.body
+	params := cfg.params
+	// jQuery sends `data` as the query string on GET/HEAD; axios keeps `data`
+	// in the body and uses `params` for the query.
+	if (method == "GET" || method == "HEAD" || method == "") && cfg.hasBodyKey && !cfg.rawJSON {
+		if len(cfg.params) == 0 {
+			params = c.paramExpr(dataValue(oe, "data"))
+			body = ""
+		}
+	}
+	if method == "" {
+		method = "GET"
+	}
+	headers := append([]contract.NameValue{}, cfg.headers...)
+	headers = append(headers, contentTypeHeader(cfg.contentType)...)
+	target := appendQuery(urlVal, params)
+	c.addLink(target, "js-api", "config", method)
+	c.addObs(target, method, headers, body)
+}
+
+// dataValue returns the value of a named property of an object literal.
+func dataValue(oe *objectExpr, key string) expr {
+	for _, p := range oe.properties {
+		if strings.EqualFold(p.key, key) {
+			return p.value
+		}
+	}
+	return nil
 }
 
 func (c *context) evalExpr(e expr) string {
@@ -1482,7 +2205,7 @@ func (c *context) evalExpr(e expr) string {
 		}
 		return ""
 	case *numberExpr:
-		return ""
+		return strings.TrimSpace(e.value)
 	case *boolExpr:
 		return ""
 	case *regexpExpr:
@@ -2047,10 +2770,17 @@ func (p *parser) expect(typ tokenType, value string) token {
 func (p *parser) parseProgram() []stmt {
 	var stmts []stmt
 	for p.peek().typ != tokEOF {
+		before := p.pos
 		s := p.parseStmt()
 		if s != nil {
 			stmts = append(stmts, s)
-		} else {
+			continue
+		}
+		// A statement that produced nothing (an empty `;`, a class/import
+		// header) has usually consumed its own token. Advancing again would
+		// silently drop the following token and desynchronise the rest of the
+		// file, so only step forward when the parser made no progress at all.
+		if p.pos == before {
 			p.advance()
 		}
 	}
@@ -3380,7 +4110,6 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 			if strings.EqualFold(methodName, "get") && !apiEndpointShape(url) {
 				break
 			}
-			c.addLink(url, "js-api", objName+"."+methodName, httpMethod)
 		}
 		// Bitrix RPC dispatch: BX.ajax.runAction('Namespace.Method', {data:{...}})
 		// POSTs to /bitrix/services/main/ajax.php with the action in the body.
@@ -3415,11 +4144,13 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 		m := strings.ToUpper(stringOr(httpMethod, "GET"))
 		var headers []contract.NameValue
 		var body string
+		var params []contract.NameValue
 		if len(args) > 1 {
 			cfg := c.parseInit(args[1])
 			headers = cfg.headers
+			params = cfg.params
 			if cfg.method != "" {
-				m = cfg.method
+				m = strings.ToUpper(cfg.method)
 			}
 			if cfg.body != "" {
 				body = cfg.body
@@ -3427,7 +4158,18 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 				body = c.bodyExpr(args[1])
 			}
 		}
+		// jQuery shorthand: on GET the payload is the query string.
+		if (m == "GET" || m == "HEAD") && body != "" && len(params) == 0 {
+			if vals := c.paramExpr(args[1]); len(vals) > 0 {
+				params = vals
+				body = ""
+			}
+		}
+		if len(params) > 0 {
+			url = appendQuery(url, params)
+		}
 		if url != "" {
+			c.addLink(url, "js-api", objName+"."+methodName, m)
 			c.addObs(url, m, headers, body)
 		}
 
@@ -3446,6 +4188,9 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 				}
 			}
 		}
+
+	case callGeneric:
+		c.applyGenericCall(args, methodName)
 
 	case callXHROpen:
 		var url string
@@ -3475,6 +4220,65 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 		c.addObs(url, httpMethod, nil, "")
 	}
 }
+
+// emitXHR records the contract observation for a tracked XMLHttpRequest.
+// applyGenericCall handles a request call identified purely by its shape: a URL
+// first argument, optionally followed by an init/payload object. The verb comes
+// from the init object, the callee's name, or the argument shape — and the last
+// of these is reported as inferred rather than silently asserted.
+func (c *context) applyGenericCall(args []expr, verb string) {
+	if len(args) == 0 {
+		return
+	}
+	// Config-object form.
+	if oe := c.configObject(args[0]); oe != nil {
+		c.analyzeConfigObj(oe)
+		return
+	}
+	url := c.resolveURLArg(args[0])
+	if url == "" {
+		return
+	}
+	var cfg initConfig
+	hasPayload := false
+	payloadIsQuery := false
+	if len(args) > 1 {
+		if oe := c.configObject(args[1]); oe != nil && isRequestConfig(oe) {
+			cfg = c.parseInit(oe)
+			hasPayload = cfg.hasBodyKey
+		} else {
+			// A bare object is the payload; whether it travels in the query or
+			// the body follows from the verb.
+			cfg.body = c.bodyExpr(args[1])
+			hasPayload = strings.TrimSpace(cfg.body) != ""
+			payloadIsQuery = readVerbs[strings.ToLower(verb)]
+		}
+	}
+	method, source := inferMethod(cfg.method, verb, hasPayload, c.inChain > 0)
+	inferred := source == srcShape || source == srcDefault
+	if method == "" {
+		method = "GET"
+		inferred = true
+	}
+	// A payload on a read belongs in the query string.
+	if hasPayload && payloadIsQuery {
+		if vals := c.paramExpr(args[1]); len(vals) > 0 {
+			url = appendQuery(url, vals)
+			cfg.body = ""
+		}
+	}
+	headers := append([]contract.NameValue{}, cfg.headers...)
+	headers = append(headers, contentTypeHeader(cfg.contentType)...)
+	url = appendQuery(url, cfg.params)
+	if url == "" || isLikelyNotAPI(url) {
+		return
+	}
+	c.addLink(url, "js-api", genericMatchSource, method)
+	c.addObsInferred(url, method, headers, cfg.body, inferred)
+}
+
+// genericMatchSource labels endpoints discovered structurally in the report.
+const genericMatchSource = "call"
 
 // emitXHR records the contract observation for a tracked XMLHttpRequest.
 func (c *context) emitXHR(name string, st *xhrInfo) {
