@@ -128,3 +128,16 @@ func keys(m map[string]bool) []string {
 	}
 	return out
 }
+
+// A client instance created with a base URL reports the URL that is actually
+// requested, and the token scan must not re-report the unresolved relative path.
+func TestClientInstanceBaseURL(t *testing.T) {
+	src := `const api = axios.create({baseURL:"/api/v2"}); api.get("/users",{params:{page:1}});`
+	_, obs := Parse(src, "https://h/", true)
+	if len(obs) != 1 {
+		t.Fatalf("expected one observation, got %d: %+v", len(obs), obs)
+	}
+	if obs[0].URL != "https://h/api/v2/users?page=1" {
+		t.Errorf("url = %q, want https://h/api/v2/users?page=1", obs[0].URL)
+	}
+}

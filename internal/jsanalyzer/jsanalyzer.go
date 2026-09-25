@@ -215,6 +215,7 @@ func (c *context) scanRequestSites(tokens []token) {
 		}
 		// A call named open()/sendBeacon() is handled by the dedicated paths.
 		verb := calleeVerbBefore(tokens, open)
+		receiver := calleeReceiverBefore(tokens, open)
 		if verb == "open" || verb == "sendBeacon" {
 			continue
 		}
@@ -242,6 +243,7 @@ func (c *context) scanRequestSites(tokens []token) {
 		if !urlArgShape(value) {
 			continue
 		}
+		value = c.applyClientBase(receiver, value)
 		method, source := inferMethod(cfg.method, verb, cfg.hasPayload, false)
 		inferred := source == srcShape || source == srcDefault
 		if method == "" {
@@ -284,6 +286,36 @@ func firstArgIndex(tokens []token, openIdx, limit int) int {
 	// Callbacks/config wrappers put the URL inside a nested expression, so step
 	// over a leading balanced group when the URL is nested.
 	return i
+}
+
+// calleeReceiverBefore returns the object a call is invoked on, as it appears
+// in the token stream ("api" in api.get(…)), so client instance defaults apply.
+func calleeReceiverBefore(tokens []token, openIdx int) string {
+	i := openIdx - 1
+	if i < 0 {
+		return ""
+	}
+	switch tokens[i].typ {
+	case tokIdent, tokKeyword:
+		name := tokens[i].value
+		if i-1 >= 0 && tokens[i-1].typ == tokPunct && tokens[i-1].value == "." {
+			// Walk back over any further receiver hops to the leftmost name.
+			j := i - 2
+			for j >= 1 && tokens[j].typ == tokPunct && tokens[j].value == "." {
+				name = tokens[j-1].value
+				j -= 2
+			}
+			return name
+		}
+	case tokString:
+		if i-1 >= 0 && tokens[i-1].typ == tokPunct && tokens[i-1].value == "[" {
+			j := i - 2
+			if j >= 0 {
+				return tokens[j].value
+			}
+		}
+	}
+	return ""
 }
 
 // calleeVerbBefore returns the property name the call at openIdx is invoked on
@@ -416,12 +448,15 @@ func scanRequestInit(tokens []token, from, to int) requestInit {
 		}
 		lit := tokenLiteralValue(tokens[valStart])
 		switch key {
-		case "url", "uri", "endpoint", "api", "baseURL":
+		case "url", "uri", "endpoint", "api":
 			// The url key sits inside the argument object, i.e. one level
 			// below the call's own parentheses.
 			if depth <= 1 {
 				cfg.fromConfig = true
 			}
+			cfg.url = lit
+		case "baseURL":
+			// A base URL is client configuration, not an endpoint.
 			cfg.url = lit
 		case "method", "type":
 			if lit != "" {
@@ -521,6 +556,29 @@ func (c *context) coveredByAST(target string) bool {
 		}
 	}
 	return false
+}
+
+// sameCallPath reports whether two URLs describe the same call, which happens
+// when a client instance base was resolved by the AST pass but not by the token
+// scan: "/users" and "/api/v2/users" are one request.
+func sameCallPath(a, b string) bool {
+	ab, bb := baseURLOf(a), baseURLOf(b)
+	if ab == bb {
+		return true
+	}
+	return strings.HasSuffix(urlPathOf(ab), urlPathOf(bb))
+}
+
+// urlPathOf returns the path of a URL, ignoring scheme and host.
+func urlPathOf(u string) string {
+	if i := strings.Index(u, "://"); i >= 0 {
+		rest := u[i+3:]
+		if j := strings.IndexByte(rest, '/'); j >= 0 {
+			return rest[j:]
+		}
+		return "/"
+	}
+	return u
 }
 
 // baseURLOf strips the query and fragment from a URL.
@@ -836,7 +894,10 @@ func (c *context) addObsFallback(rawURL, method, body string) {
 		return
 	}
 	for _, seen := range c.astObs {
-		if seen.method == strings.ToUpper(method) && seen.url == u {
+		if seen.method != strings.ToUpper(method) {
+			continue
+		}
+		if seen.url == u || sameCallPath(seen.url, u) {
 			return
 		}
 	}
@@ -858,6 +919,7 @@ func stringOr(s, def string) string {
 
 // initConfig captures the shape of a fetch/Request init object literal.
 type initConfig struct {
+	baseURL     string
 	method      string
 	body        string
 	headers     []contract.NameValue
@@ -898,6 +960,8 @@ func (c *context) parseInit(e expr) initConfig {
 			cfg.headers = c.headersExpr(p.value)
 		case "contenttype":
 			cfg.contentType = c.evalExpr(p.value)
+		case "baseurl":
+			cfg.baseURL = c.evalExpr(p.value)
 		case "processdata":
 			// processData:false means the object is sent verbatim as JSON.
 			if strings.EqualFold(strings.TrimSpace(c.evalExpr(p.value)), "false") {
@@ -1378,7 +1442,7 @@ func flattenConcat(e expr, out *[]expr) {
 }
 
 var configPropKeys = map[string]bool{
-	"url": true, "uri": true, "endpoint": true, "api": true, "baseURL": true,
+	"url": true, "uri": true, "endpoint": true, "api": true,
 	"ajaxUrl": true, "ajax_url": true,
 }
 
@@ -2433,7 +2497,7 @@ func (c *context) resolveCall(ce *callExpr) (match callMatch, objName, methodNam
 	// analyzer work on wrapped, aliased and minified clients instead of only
 	// on a fixed list of known library names.
 	if c.genericRequestArgs(ce) != "" {
-		return callGeneric, "", calleeProperty(ce.callee), ""
+		return callGeneric, calleeObjectName(ce.callee), calleeProperty(ce.callee), ""
 	}
 
 	return callNone, "", "", ""
@@ -2514,6 +2578,19 @@ func (c *context) configObject(e expr) *objectExpr {
 		}
 	}
 	return nil
+}
+
+// calleeObjectName returns the object a method is invoked on ("api" in
+// api.get(url)), or "" for a bare call.
+func calleeObjectName(callee expr) string {
+	switch n := callee.(type) {
+	case *memberExpr:
+		chain := memberChain(n)
+		if len(chain) >= 2 {
+			return chain[0]
+		}
+	}
+	return ""
 }
 
 // calleeProperty returns the last property of a call target: the member name for
@@ -4551,6 +4628,9 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 			url = c.resolveURLArg(args[0])
 		}
 		if url != "" {
+			// Resolve a client instance base before judging the shape: "/users"
+			// on an axios.create({baseURL:"/api"}) instance is /api/users.
+			url = c.applyClientBase(receiverOf(objName), url)
 			// Routers and non-HTTP libs also expose .get('/path'); for GET
 			// calls require an explicit API signal so page routes do not
 			// masquerade as endpoints. Other verbs are call-specific enough.
@@ -4637,7 +4717,7 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 		}
 
 	case callGeneric:
-		c.applyGenericCall(args, methodName)
+		c.applyGenericCall(args, methodName, objName)
 
 	case callXHROpen:
 		var url string
@@ -4673,7 +4753,7 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 // first argument, optionally followed by an init/payload object. The verb comes
 // from the init object, the callee's name, or the argument shape — and the last
 // of these is reported as inferred rather than silently asserted.
-func (c *context) applyGenericCall(args []expr, verb string) {
+func (c *context) applyGenericCall(args []expr, verb, objName string) {
 	if len(args) == 0 {
 		return
 	}
@@ -4686,6 +4766,7 @@ func (c *context) applyGenericCall(args []expr, verb string) {
 	if url == "" {
 		return
 	}
+	url = c.applyClientBase(objName, url)
 	var cfg initConfig
 	hasPayload := false
 	payloadIsQuery := false
@@ -4723,6 +4804,32 @@ func (c *context) applyGenericCall(args []expr, verb string) {
 	}
 	c.addLink(url, "js-api", genericMatchSource, method)
 	c.addObsInferred(url, method, headers, cfg.body, inferred)
+}
+
+// receiverOf returns the object from a call's full path ("api.get" -> "api").
+func receiverOf(fullPath string) string {
+	if i := strings.Index(fullPath, "."); i > 0 {
+		return fullPath[:i]
+	}
+	return fullPath
+}
+
+// applyClientBase resolves a relative endpoint against the baseURL of a
+// client instance created with axios.create({baseURL: '/api'}), so instance
+// calls report the URL that is actually requested.
+func (c *context) applyClientBase(objName, url string) string {
+	if objName == "" {
+		return url
+	}
+	cfg, ok := c.clientInst[objName]
+	if !ok {
+		return url
+	}
+	base := strings.TrimSpace(cfg.baseURL)
+	if base == "" || !strings.HasPrefix(url, "/") || strings.HasPrefix(url, "//") {
+		return url
+	}
+	return strings.TrimRight(base, "/") + url
 }
 
 // genericMatchSource labels endpoints discovered structurally in the report.

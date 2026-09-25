@@ -66,6 +66,9 @@ type Field struct {
 	Constant bool
 	ConstVal string
 	Nullable bool
+	// Inferred marks a field whose name came from static analysis while no
+	// value was ever observed for it, so no type or constness can be claimed.
+	Inferred bool
 }
 
 // BodyFormat is one detected request-body schema for an endpoint.
@@ -356,13 +359,39 @@ func addValue(list []Field, name string, vals ...string) []Field {
 }
 
 func addFieldValue(list []Field, name, value string) []Field {
+	// A "<name>" value is the placeholder the static pass substitutes when it
+	// recovers a field name from a concatenated form body. It proves the field
+	// exists, not what it holds, so it must not become an observed value —
+	// otherwise a runtime capture of the same field turns into an enum holding
+	// both the real value and the placeholder.
+	inferred := isPlaceholderValue(name, value)
 	for i := range list {
-		if list[i].Name == name {
-			list[i].Values = addString(list[i].Values, value)
+		if list[i].Name != name {
+			continue
+		}
+		if inferred {
+			list[i].Inferred = true
 			return list
 		}
+		list[i].Values = addString(list[i].Values, value)
+		return list
+	}
+	if inferred {
+		return append(list, Field{Name: name, Inferred: true})
 	}
 	return append(list, Field{Name: name, Values: []string{value}})
+}
+
+// isPlaceholderValue reports whether a value is the synthetic "<name>" marker.
+func isPlaceholderValue(name, value string) bool {
+	if name == "" {
+		return false
+	}
+	if value == "<"+name+">" {
+		return true
+	}
+	return len(value) > 2 && strings.HasPrefix(value, "<") && strings.HasSuffix(value, ">") &&
+		!strings.ContainsAny(value, " \t")
 }
 
 // finalizeFields computes kinds, constants and nullable flags.
@@ -370,6 +399,10 @@ func finalizeFields(fields []Field) []Field {
 	for i := range fields {
 		f := &fields[i]
 		f.Kind = inferKind(f.Name, f.Values)
+		if f.Inferred && len(f.Values) == 0 {
+			// Name recovered from code, nothing observed: claim no type.
+			f.Kind = "unknown"
+		}
 		if len(f.Values) == 1 {
 			f.Constant = true
 			f.ConstVal = f.Values[0]
@@ -487,7 +520,10 @@ func placeholder(f Field) string {
 	case "bool":
 		return "false"
 	case "enum":
-		return strings.Join(f.Values, "|")
+		if len(f.Values) > 0 {
+			return f.Values[0]
+		}
+		return "<" + f.Name + ">"
 	case "token":
 		return "<" + f.Name + ">"
 	case "date":
@@ -939,6 +975,11 @@ func renderFields(b *strings.Builder, fields []Field, col bool) {
 	for _, f := range fields {
 		b.WriteString("    " + paint(col, color.DarkCyan, pad(f.Name, 24)))
 		b.WriteString(paint(col, fieldKindColor(f.Kind), pad(f.Kind, 8)))
+		if f.Inferred && len(f.Values) == 0 {
+			b.WriteString(paint(col, color.DarkGray, "(name from code, no value observed)"))
+			b.WriteString("\n")
+			continue
+		}
 		switch f.Kind {
 		case "token":
 			suffix := "(varies)"
