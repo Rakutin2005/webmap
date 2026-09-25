@@ -29,9 +29,9 @@ URL reached by every network call.
 Requires Go 1.26+.
 
 ```bash
-go build -o webmap cmd/webmap/main.go
+make build
 # or
-./build.sh
+go build -o webmap ./cmd/webmap
 ```
 
 ## Usage
