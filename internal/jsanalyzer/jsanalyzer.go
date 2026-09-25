@@ -42,7 +42,9 @@ func ParseWithParams(jsContent string, sourceURL string, fullInfo bool) (result 
 	// real code they are often written after the request itself.
 	ctx.collectDeclarations(stmts)
 	ctx.scanParamBuilders(tokens)
+	ctx.trackBuilderAliases(tokens)
 	ctx.linkScopeFields()
+	ctx.markPageURLBuilders(tokens)
 	ctx.analyze(stmts)
 	ctx.resolvePending()
 
@@ -320,7 +322,7 @@ func (c *context) bindRequestScopesFull(args []expr, endpoint string, urlExpr ex
 	carrier := c.requestCarrier(endpoint, urlExpr)
 	for _, a := range args {
 		if b := c.builderInExpr(a); b != "" {
-			c.bindBuilderToRequest(b, endpoint)
+			c.bindBuilderToRequest(b, endpoint, carrier)
 		}
 	}
 	for _, sc := range c.scopesInArgs(args) {
@@ -407,6 +409,20 @@ func (c *context) collectStmt(s stmt) {
 		if call, ok := s.init.(*callExpr); ok {
 			switch callee := call.callee.(type) {
 			case *memberExpr:
+				if callee.property == "toString" {
+					// A stringified builder is still that builder: keeping
+					// the origin is what lets "var q = this.build(); var qs
+					// = q.toString(); history.replaceState(…qs…)" be traced
+					// back to the names build() writes.
+					if id, ok := callee.object.(*identExpr); ok {
+						if fn := c.builderScope[id.name]; fn != "" {
+							c.varScope[s.name] = fn
+						} else if root := c.varScope[id.name]; root != "" {
+							c.varScope[s.name] = root
+						}
+					}
+					break
+				}
 				c.varScope[s.name] = callee.property
 			case *identExpr:
 				c.varScope[s.name] = callee.name
@@ -547,6 +563,148 @@ func (c *context) analyzeClass(e *classExpr) {
 			c.analyze(fe.body.stmts)
 		}
 		c.funcStack = c.funcStack[:len(c.funcStack)-1]
+	}
+}
+
+// isPunctOrOp accepts a symbol regardless of whether the tokenizer filed it as
+// punctuation or as an operator: "=" and "." are not treated the same way.
+func isPunctOrOp(t token, value string) bool {
+	return (t.typ == tokPunct || t.typ == tokOp) && t.value == value
+}
+
+// trackBuilderAliases follows "var q = p.toString()" so the builder is still
+// recognised when it travels through a temporary on its way to a request or to
+// the address bar.
+func (c *context) trackBuilderAliases(tokens []token) {
+	if len(c.builderKind) == 0 {
+		return
+	}
+	for i := 0; i+4 < len(tokens); i++ {
+		if tokens[i].typ != tokIdent || !isPunctOrOp(tokens[i+1], "=") {
+			continue
+		}
+		if tokens[i+2].typ != tokIdent || !isPunctOrOp(tokens[i+3], ".") {
+			continue
+		}
+		if tokens[i+4].typ != tokIdent || tokens[i+4].value != "toString" {
+			continue
+		}
+		if _, tracked := c.builderKind[tokens[i+2].value]; tracked {
+			c.builderAlias[tokens[i].value] = tokens[i+2].value
+		}
+	}
+}
+
+// resolveBuilder returns the builder a name stands for, directly or through a
+// temporary derived from it.
+func (c *context) resolveBuilder(name string) string {
+	if _, tracked := c.builderKind[name]; tracked {
+		return name
+	}
+	if b, ok := c.builderAlias[name]; ok {
+		return b
+	}
+	return ""
+}
+
+// pageURLMethods write the page's own address. A builder that feeds one is not
+// an API parameter: it rewrites the URL the visitor is on, which is what
+// filters and share links do. Without this they are reported as unattributed.
+var pageURLMethods = map[string]bool{
+	"pushState": true, "replaceState": true, "assign": true, "replace": true,
+}
+
+// markPageURLBuilders attributes builder fields to the page's own query string
+// when they are pushed into the address bar.
+func (c *context) markPageURLBuilders(tokens []token) {
+	if len(c.builderKind) == 0 {
+		return
+	}
+	for i, t := range tokens {
+		if t.typ != tokIdent || !pageURLMethods[t.value] {
+			continue
+		}
+		// Must be called on the address: history.pushState, location.assign.
+		if i < 2 {
+			continue
+		}
+		owner := tokens[i-2]
+		if owner.typ != tokIdent || (owner.value != "history" && owner.value != "location") {
+			continue
+		}
+		open := -1
+		for j := i + 1; j < len(tokens) && j <= i+3; j++ {
+			if tokens[j].typ == tokPunct && tokens[j].value == "(" {
+				open = j
+				break
+			}
+		}
+		if open < 0 {
+			continue
+		}
+		closeIdx := matchParenFrom(tokens, open)
+		if closeIdx < 0 {
+			continue
+		}
+		for k := open + 1; k < closeIdx && k < len(tokens); k++ {
+			if tokens[k].typ != tokIdent && tokens[k].typ != tokKeyword {
+				continue
+			}
+			name := tokens[k].value
+			// The builder may sit behind a temporary...
+			if builder := c.resolveBuilder(name); builder != "" {
+				if c.builderKind[builder] != linker.ParamForm {
+					c.promoteOwner(builder, linker.OwnerLocation)
+				}
+				continue
+			}
+			// ...or behind the method that fills it, which is how a filter
+			// panel usually reaches the address bar.
+			for _, scope := range c.scopesForName(name) {
+				c.promoteScopeOwner(scope, linker.OwnerLocation)
+			}
+		}
+	}
+}
+
+// scopesForName resolves a name to the methods whose builders it may stand
+// for: the method itself when called directly, or the method a variable
+// received its result from.
+func (c *context) scopesForName(name string) []string {
+	var out []string
+	if len(c.scopeFields[name]) > 0 {
+		out = append(out, name)
+	}
+	if scope := c.varScope[name]; scope != "" && len(c.scopeFields[scope]) > 0 {
+		out = append(out, scope)
+	}
+	return out
+}
+
+// promoteScopeOwner moves every name a method builds to a stronger owner.
+func (c *context) promoteScopeOwner(scope string, owner linker.ParamOwner) {
+	fields := make(map[string]bool, len(c.scopeFields[scope]))
+	for _, n := range c.scopeFields[scope] {
+		fields[n] = true
+	}
+	for i := range c.paramRefs {
+		if fields[c.paramRefs[i].Name] && c.paramRefs[i].Owner == linker.OwnerUnknown {
+			c.paramRefs[i].Owner = owner
+		}
+	}
+}
+
+// promoteOwner moves a builder's names to a stronger owner, leaving the ones
+// already attributed where they are.
+func (c *context) promoteOwner(builder string, owner linker.ParamOwner) {
+	fields := c.formData[builder]
+	for i := range c.paramRefs {
+		if _, ok := fields[c.paramRefs[i].Name]; !ok {
+			continue
+		}
+		if c.paramRefs[i].Owner == linker.OwnerUnknown {
+			c.paramRefs[i].Owner = owner
+		}
 	}
 }
 
@@ -786,12 +944,12 @@ func (c *context) scopesInExpr(e expr) []string {
 	return out
 }
 
-func (c *context) bindBuilderToRequest(builder, endpoint string) {
+// bindBuilderToRequest attributes a builder's names to a request. The endpoint
+// may be empty when the address is not known: the names still belong to that
+// request, and the carrier says where it goes.
+func (c *context) bindBuilderToRequest(builder, endpoint, carrier string) {
 	fields := c.formData[builder]
 	if len(fields) == 0 {
-		return
-	}
-	if endpoint == "" {
 		return
 	}
 	if c.boundBuilders == nil {
@@ -814,7 +972,7 @@ func (c *context) bindBuilderToRequest(builder, endpoint string) {
 			c.noteScopeField(fn, n)
 		}
 	}
-	c.bindFieldsToRequest(builder, names, c.builderKind[builder], endpoint, "")
+	c.bindFieldsToRequest(builder, names, c.builderKind[builder], endpoint, carrier)
 }
 
 // bindScopeToRequest attributes the parameters a method builds to the request
@@ -924,8 +1082,8 @@ func (c *context) bindBuilderParams(tokens []token) {
 			if tokens[i].typ != tokIdent {
 				continue
 			}
-			if _, tracked := c.builderKind[tokens[i].value]; tracked {
-				c.bindBuilderToRequest(tokens[i].value, endpoint)
+			if builder := c.resolveBuilder(tokens[i].value); builder != "" {
+				c.bindBuilderToRequest(builder, endpoint, "")
 			}
 		}
 	}
@@ -1649,6 +1807,10 @@ type context struct {
 	// ("app.ajaxUrl = '/api/...'" below the component), so these are retried
 	// once the whole file has been read.
 	pending []pendingBinding
+	// builderAlias maps a temporary back to the builder it was derived from
+	// ("var q = p.toString()"), which is how a builder usually reaches the
+	// address bar or a request URL.
+	builderAlias map[string]string
 	// paramCount maps a name/kind/owner key to its index in paramRefs and
 	// folds repeated occurrences of the same name into one record.
 	paramCount map[string]int
@@ -1705,6 +1867,7 @@ func newContext(sourceURL string, fullInfo bool) *context {
 		scopeFields:         map[string][]string{},
 		scopeKind:           map[string]linker.ParamKind{},
 		builderScope:        map[string]string{},
+		builderAlias:        map[string]string{},
 		varScope:            map[string]string{},
 		props:               map[string]map[string]string{},
 		varInits:            map[string]expr{},
@@ -5924,7 +6087,7 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 			target := resolveEndpoint(trimURLJoin(url), c.sourceURL)
 			for _, a := range args {
 				if b := c.builderInExpr(a); b != "" {
-					c.bindBuilderToRequest(b, target)
+					c.bindBuilderToRequest(b, target, "")
 				}
 			}
 			c.bindRequestScopes(args, target, args[0])
@@ -6044,7 +6207,7 @@ func (c *context) applyGenericCall(args []expr, verb, objName string) {
 	target := resolveEndpoint(trimURLJoin(url), c.sourceURL)
 	for _, a := range args {
 		if b := c.builderInExpr(a); b != "" {
-			c.bindBuilderToRequest(b, target)
+			c.bindBuilderToRequest(b, target, "")
 		}
 	}
 	c.bindRequestScopes(args, target, args[0])

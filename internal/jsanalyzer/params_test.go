@@ -286,3 +286,62 @@ app.methods.load();
 		}
 	}
 }
+
+// A builder pushed into the address bar rewrites the page's own URL: filters,
+// sorting and share links all do it. Those names belong to the page, not to
+// any API, and reporting them as unattributed hid where they actually go.
+func TestPageURLBuilderOwnership(t *testing.T) {
+	js := `
+function applyFilters(state) {
+  var p = new URLSearchParams();
+  if (state.min) p.set('price_min', state.min);
+  if (state.sort) p.set('sort', state.sort);
+  var q = p.toString();
+  history.pushState({}, '', window.location.pathname + (q ? '?' + q : ''));
+}
+`
+	_, _, params := ParseWithParams(js, "https://h/catalog/", true)
+	want := map[string]string{"price_min": "page query state", "sort": "page query state"}
+	got := map[string]string{}
+	for _, p := range params {
+		got[p.Name] = p.OwnerLabel()
+	}
+	for name, owner := range want {
+		if got[name] != owner {
+			t.Errorf("param %q owner = %q, want %q (all: %v)", name, got[name], owner, got)
+		}
+	}
+}
+
+// The usual shape is a chain: a method builds the query, the result is
+// stringified into a temporary, and the temporary reaches the address bar.
+// Each hop is enough to lose the attribution if only the last one is checked.
+func TestPageURLBuilderThroughAliasChain(t *testing.T) {
+	js := `
+var app = {
+  methods: {
+    buildShareParams: function() {
+      var p = new URLSearchParams();
+      p.append('floors_in', '2');
+      p.append('psqm_max', 90);
+      return p;
+    },
+    updateUrl: function() {
+      var q = this.buildShareParams();
+      var qs = q.toString();
+      window.history.replaceState(null, '', '/apartments/' + (qs ? '?' + qs : ''));
+    }
+  }
+};
+`
+	_, _, params := ParseWithParams(js, "https://h/apartments/", true)
+	got := map[string]string{}
+	for _, p := range params {
+		got[p.Name] = p.OwnerLabel()
+	}
+	for _, name := range []string{"floors_in", "psqm_max"} {
+		if got[name] != "page query state" {
+			t.Errorf("param %q owner = %q, want page query state (all: %v)", name, got[name], got)
+		}
+	}
+}

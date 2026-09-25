@@ -156,12 +156,17 @@ func renderFragmentFindings(cfg *config.Config, displayLinks []linker.Link) {
 	}
 	observed := observedParamNames(displayLinks)
 
-	// Group by owner first, then by kind: the owner is the fact that decides
-	// whether a name describes an API request or the page's own query string.
+	// A name that reached a contract is already reported there, with the same
+	// attribution. Repeating it here would say the same thing twice in two
+	// places, and the reader could not tell which of the two was the finding.
+	// This section is for what the contracts do not cover.
 	groups := map[string][]linker.ParamRef{}
 	for _, p := range params {
 		if observed[p.Name] {
 			// The link rows already carry this key as "(params: …)".
+			continue
+		}
+		if len(p.Endpoints) > 0 {
 			continue
 		}
 		groups[p.OwnerLabel()+" / "+p.KindLabel()] = append(groups[p.OwnerLabel()+" / "+p.KindLabel()], p)
