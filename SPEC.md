@@ -59,6 +59,8 @@
 | `-emu-timeout MS` | Max ms of JS execution per page (default 5000, 0 = unlimited). A watchdog interrupts runaway/animation loops. |
 | `-emu-maxjs KB` | Skip scripts larger than this (default 3072 KB, 0 = unlimited). |
 | `-emu-maxjobs N` | Max event-loop jobs (timers/promises) per page (default 2000). |
+| `-o <file.wmse>` | Write the whole scan to a static-explorer file (see below). Read it later with `wmse read <file>`, using the same flags. |
+| `-o-raw` | Write the `-o` file with no section compression: larger, but a reader can map a section without inflating it. |
 
 ### Resource limits & optimizations
 
@@ -111,6 +113,133 @@ synthetic responses.
    - Category/type coloring: API (cyan), page (green), assets (by subtype: js=yellow, css=blue, img=purple, font=dim, media=cyan, data=dark yellow)
 3. **Graph** (-G): ASCII tree/graph visualization
 4. **Markdown** (-M): `[url].wmap/` directory with markdown files
+5. **Static explorer file** (-o): a single binary file, read back offline by `wmse`
+
+## Saved Scans and the Static Explorer (`-o`, `wmse`)
+
+### Requirement
+
+A saved scan must contain the maximum useful information available for
+off-line exploitation, at the smallest size that can hold it, in a format an
+offline reader can explore as a *graph* rather than a list.
+
+### What is saved
+
+Everything the scan produced, including what the printed report discards:
+
+- every link, with its category, link type, URL class, tag, **the query it was
+  requested with**, API details including the call's **argument list**,
+  **depth in the crawl**, and the page it was found on;
+- every page actually fetched, with depth, content type and link count — the only
+  record of *why* a link was never followed (depth limit, class filter, domain
+  rule);
+- URL patterns, their members, and the values their variables were seen taking;
+- inferred API contracts, and the **raw observations** they were inferred from;
+- parameters recovered from request builders, with the documents they came from;
+- the emulation summary and every intercepted call;
+- the statistics, the flags, the target, and the command line that produced it —
+  including the depth the crawl was *allowed* to reach, as a number, because a
+  crawl that stopped at its limit has pages it never fetched and a reader asked
+  for more has to be told which of the two it is looking at.
+
+Two of those are there because a report drops them and a file must not: the
+argument list of a call (`-apif` prints it, and folding it away would make the
+flag unanswerable from a saved scan) and the query of a link (the row annotation,
+and the rule that stops a recovered parameter being reported a second time). A
+node the snapshot added so a relation had an endpoint is marked as such, so a
+reader prints the same link table the run printed rather than the run's plus every
+page nothing linked to.
+
+Header **values** configured with `-H`/`-b` are not stored (their names are, and
+`session_data=true` marks a file that may hold captured session material); the
+requests the scan actually sent are stored as captured, because they are the
+evidence.
+
+### Format
+
+A property graph in one file: `magic + version + header length + flags +
+directory`, then eleven independent sections (`meta`, `stats`, `strings`,
+`links`, `edges`, `groups`, `endpoints`, `observations`, `params`, `emulation`,
+`dicts`), each with its own codec and length in the directory, and each
+deflated independently. Sections are decoded on demand, so a reader that only
+wants the links never inflates the emulation log.
+
+Size comes from two mechanisms:
+
+- **Graph distribution** — one interned string table for the whole file, sorted
+  and front-coded; repeated sub-structures (pattern variables, contract fields,
+  observed header sets) interned by content into dictionaries and referenced by a
+  one-based id, with `0` reserved so an absent field costs nothing; relations
+  encoded as delta- and run-length-coded edges.
+- **Location** — a link is stored as its distance from the previous link in
+  sorted order rather than as a repeated literal, and an edge whose endpoints did
+  not change costs a few bits.
+
+Target: 5.5 bytes per link on a 20 000-link scan — 58× smaller than the same
+scan as JSON, 8× smaller than the same format with compression switched off, and
+sublinear in scan size. The ratio is asserted by
+`internal/wmse/perf_test.go`, so a change that quietly gives up the compression
+the format earns by itself fails the build rather than the documentation.
+
+### Reader
+
+`wmse` is the scan with the network replaced by the file, so it takes the scan's
+arguments: the same flags, the same names, the same types, the same defaults,
+registered by the same `config.Register`, and spelled with one dash like every
+flag in the scan. They may appear on either side of the file path, so a scan
+command line replays by changing the verb:
+
+```
+webmap -r -apic -emulate -o scan.wmse -url https://example.com
+wmse  read -r -apic -emulate      scan.wmse
+```
+
+The report is the scan's report: the same sections in the same order, each behind
+the same flag — `-r` the crawl as a tree, `-rdepth` its cut, `-apic` the
+contracts, `-apic-raw` the requests behind them, `-apif` the API rows as method
+and arguments, `-emulate` the sandbox, `-G` the relation graph, `-nogroup` no
+pattern section, `-waf`/`-cdn`/`-cache`/`-noise`/`-full` the URL classes, `-t` the
+tags, the dynamic query params ungated, `-color`. The reader adds what a terminal
+report has no room for: which file this is, what the run that made it was, which
+pages were fetched, and which page each link was found on.
+
+Rules that follow from the file being the only source of data:
+
+- **A request the file cannot answer is an error, not an empty section.** It names
+  the flag, prints the metadata of the run that made the file, leaves the rest of
+  the report intact, writes the diagnostic to stderr and exits non-zero.
+  "No contracts" and "this scan looked for none" must not look the same.
+- **`-rdepth` is the reader's, not the file's.** A saved crawl cannot be deeper
+  than the depth it was made with, so the default is the whole tree; `-rdepth 3`
+  cuts at three even when the file was crawled to five, and the tree says how much
+  is below the cut. Asking for more than the crawl was *allowed* to reach is an
+  error naming that limit — asking for more than the pages happen to go is not,
+  because a crawl that ended because the site ended is complete.
+- **`-rlimit` bounds the lines of the report**, since the requests are already
+  made, and it is one budget for the whole request: twenty lines means twenty
+  lines, wherever they were spent. Section titles are structure rather than
+  content and are not counted, and running out says so — a report that ends
+  without a word reads as the whole of it.
+- **The scope flags narrow the report.** The scan's own table lists every link it
+  found on any domain — its scope decides what it fetched, not what it shows — so a
+  reader with no scope flag reports the same set, and `-url`/`-f`/`-a` are the way
+  to ask what a differently-scoped run would have seen.
+- **Flags that only configured the crawl are accepted and ignored**: `-k`, `-cf`,
+  `-j`, `-str`, `-M`, `-T`, `-group-count`, `-H`, `-b`, `-cookie`,
+  `-headers-all-hosts`, `-o`, `-o-raw`, `-patterns`, `-bitrix`, `-wp`, `-react`,
+  `-emu-*`. No file can be crawled or written.
+- **What the file *is* is a verb, not a flag**: `wmse info` (layout, size per
+  section, the full saved metadata, hosts) and `wmse json` (the whole snapshot, for
+  another tool). Both take the same flags as `read`.
+- `-h` prints the usage to stdout and exits 0; a bad flag prints the message and
+  the usage to stderr and exits 2, the way the scan answers one. A missing file, a
+  file that is not a snapshot, a truncated one and a corrupt section are all
+  errors, never a panic.
+
+The one place the reader's numbers differ from the run's printed ones is `With
+query params`: the run counts its in-memory set before folding query variants,
+while the file kept every link's query, so the reader counts the links that carry
+one. It is the number the link table below it shows.
 
 ## Acceptance Criteria
 
@@ -127,3 +256,12 @@ synthetic responses.
 - [x] Skips Cloudflare/WAF URLs by default (-cf to include)
 - [x] Supports -color flag for ANSI-colorized output with domain/type coloring
 - [x] Supports -apif flag for detailed API info (method, args, match pattern)
+- [x] `-o` writes a complete, self-describing scan to one file
+- [x] Every URL referenced by a relation is a node, so the graph has no dangling edges
+- [x] `wmse` takes the scan's flags, one for one, and means what they meant there
+- [x] `wmse read` prints the scan's report, sections and gates alike
+- [x] A flag asking for data the file does not hold is an error with the run's metadata
+- [x] `-rdepth` cuts the tree where the reader is asked, not where the scan stopped
+- [x] `wmse read` explores the file offline and round-trips every section losslessly
+- [x] A 20 000-link scan serializes to 5.5 bytes per link, sublinearly
+- [x] Configured credential values are absent from the file; captured requests are kept
