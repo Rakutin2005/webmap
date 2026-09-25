@@ -15,10 +15,21 @@ import (
 )
 
 func Parse(jsContent string, sourceURL string, fullInfo bool) (result []linker.Link, obs []contract.Observation) {
+	result, obs, _ = ParseWithParams(jsContent, sourceURL, fullInfo)
+	return result, obs
+}
+
+// ParseWithParams behaves like Parse and additionally reports the parameter
+// names recovered from request builders (URLSearchParams/FormData), each
+// classified by kind and by what it feeds. Names written into a builder that is
+// then passed to a request are also attached to that endpoint as inferred query
+// parameters, so the contract lists them without inventing a value.
+func ParseWithParams(jsContent string, sourceURL string, fullInfo bool) (result []linker.Link, obs []contract.Observation, params []linker.ParamRef) {
 	defer func() {
 		if r := recover(); r != nil {
 			result = nil
 			obs = nil
+			params = nil
 		}
 	}()
 	ctx := newContext(sourceURL, fullInfo)
@@ -28,23 +39,23 @@ func Parse(jsContent string, sourceURL string, fullInfo bool) (result []linker.L
 
 	ctx.analyze(stmts)
 
-	// Token-level scan for HTTP-client calls (client.get/post/...) that the AST
-	// analysis cannot reach — either the parser bailed out on the surrounding
-	// minified code, or the client object is an unrecognized short name.
+	// Token-level passes for signals the AST analysis cannot reach: minified
+	// code where the parser gives up, and clients with arbitrary names.
+	ctx.scanParamBuilders(tokens)
 	ctx.scanRequestSites(tokens)
 	ctx.scanResponseFields(tokens)
+	ctx.bindBuilderParams(tokens)
 	ctx.scanCalls(tokens, jsContent)
 
 	// Robust fallback: many endpoints are built at runtime (e.g.
 	// fetch(this.ajaxUrl + '?' + params)) or live inside config/JSON blobs the
 	// call-graph analysis can't trace back. Harvest endpoint-looking string
-	// literals directly from the token stream so those still surface. This runs
-	// on tokens (not the AST) so it works even when parsing bails out on minified
-	// or exotic syntax.
+	// literals directly from the token stream so those still surface.
 	ctx.harvestTokens(tokens)
 	ctx.flushXHR()
 	ctx.attachResponseFields()
-	return ctx.links, ctx.obs
+	ctx.attachInferredQuery()
+	return ctx.links, ctx.obs, ctx.paramRefs
 }
 
 // attachResponseFields copies the statically inferred response schema onto the
@@ -77,6 +88,269 @@ func (c *context) attachResponseFields() {
 		for _, p := range paths {
 			c.obs[i].ResponseFields = append(c.obs[i].ResponseFields, contract.ResponseField{Path: p, Kind: set[p]})
 		}
+	}
+}
+
+// builderQueryNames and builderFormNames recognise builders by their variable
+// name when the construction was not seen (minified code, helper scope).
+var (
+	builderQueryNames = map[string]bool{
+		"urlsearchparams": true, "searchparams": true, "params": true,
+		"query": true, "qs": true, "sp": true, "search": true, "usp": true,
+		"queryparams": true, "filters": true, "sort": true,
+	}
+	builderFormNames = map[string]bool{
+		"formdata": true, "form": true, "fd": true, "multipart": true,
+	}
+)
+
+// scanParamBuilders classifies the parameters written into request builders.
+// A builder is recognised structurally (new URLSearchParams()/new FormData())
+// and, failing that, by the conventional receiver names. Names that end up in a
+// request are bound to that endpoint; the rest describe the page's own query
+// string and are reported without being attributed to any API.
+func (c *context) scanParamBuilders(tokens []token) {
+	c.markLocationBuilders(tokens)
+	for i := range tokens {
+		t := tokens[i]
+		if t.typ != tokIdent && t.typ != tokKeyword {
+			continue
+		}
+		if t.value != "set" && t.value != "append" {
+			continue
+		}
+		if i+1 >= len(tokens) || tokens[i+1].typ != tokPunct || tokens[i+1].value != "(" {
+			continue
+		}
+		if i+2 >= len(tokens) || tokens[i+2].typ != tokString {
+			continue
+		}
+		receiver := ""
+		if i >= 2 && tokens[i-1].typ == tokPunct && tokens[i-1].value == "." &&
+			(tokens[i-2].typ == tokIdent || tokens[i-2].typ == tokKeyword) {
+			receiver = tokens[i-2].value
+		}
+		if receiver == "" {
+			continue
+		}
+		name := tokens[i+2].value
+		kind, known := c.builderKind[receiver]
+		if !known {
+			lower := strings.ToLower(receiver)
+			switch {
+			case builderQueryNames[lower]:
+				kind = linker.ParamQuery
+			case builderFormNames[lower]:
+				kind = linker.ParamForm
+			default:
+				kind = linker.ParamUnknown
+			}
+		}
+		// A set() on a builder marks the name as belonging to a request; on an
+		// unrecognised receiver we still report it, flagged as unclassified.
+		owner := linker.OwnerUnknown
+		if known || builderIsQueryish(lowerKind(kind)) {
+			owner = c.ownerForBuilder(receiver)
+		}
+		c.recordParamRef(name, kind, owner)
+		c.noteBuilderField(receiver, name)
+	}
+}
+
+func lowerKind(k linker.ParamKind) linker.ParamKind { return k }
+
+// markLocationBuilders flags builders seeded from the current page URL:
+// `const sp = new URLSearchParams(new URL(location.href).searchParams)`. Their
+// parameters describe page state, not an API request.
+func (c *context) markLocationBuilders(tokens []token) {
+	for i := range tokens {
+		if tokens[i].typ != tokIdent {
+			continue
+		}
+		if tokens[i].value != "URLSearchParams" && tokens[i].value != "FormData" {
+			continue
+		}
+		if i+1 >= len(tokens) || tokens[i+1].typ != tokPunct || tokens[i+1].value != "(" {
+			continue
+		}
+		// Look for a location-derived seed inside the constructor.
+		seeded := false
+		for j := i + 2; j < len(tokens) && j < i+40; j++ {
+			if tokens[j].typ == tokIdent && (tokens[j].value == "location" || tokens[j].value == "href") {
+				seeded = true
+				break
+			}
+			if tokens[j].typ == tokPunct && tokens[j].value == ")" {
+				break
+			}
+		}
+		// Assign the builder to a variable, if there is one. The "new" keyword
+		// sits between the assignment and the constructor, so step over it.
+		j := i - 1
+		if j >= 0 && tokens[j].typ == tokKeyword && tokens[j].value == "new" {
+			j--
+		}
+		if j >= 1 && tokens[j].typ == tokOp && tokens[j].value == "=" {
+			owner := tokens[j-1]
+			if owner.typ == tokIdent {
+				c.formData[owner.value] = map[string]string{}
+				if tokens[i].value == "FormData" {
+					c.builderKind[owner.value] = linker.ParamForm
+				} else {
+					c.builderKind[owner.value] = linker.ParamQuery
+				}
+				if seeded {
+					c.builderFromLocation[owner.value] = true
+				}
+			}
+		}
+	}
+}
+
+// builderIsQueryish reports whether a kind represents a query-string builder.
+func builderIsQueryish(k linker.ParamKind) bool { return k == linker.ParamQuery }
+
+// ownerForBuilder decides what a builder feeds: a request it was passed to, or
+// the current page's query string.
+func (c *context) ownerForBuilder(name string) linker.ParamOwner {
+	if c.builderFromLocation[name] {
+		return linker.OwnerLocation
+	}
+	for endpoint := range c.paramBound {
+		if c.builderFeeds(endpoint, name) {
+			return linker.OwnerRequest
+		}
+	}
+	if c.paramBoundFor(name) {
+		return linker.OwnerRequest
+	}
+	return linker.OwnerUnknown
+}
+
+// builderFeeds reports whether a builder variable was used by a request.
+func (c *context) builderFeeds(endpoint, builder string) bool {
+	return c.boundBuilders[endpoint] != nil && c.boundBuilders[endpoint][builder]
+}
+
+// paramBoundFor reports whether any endpoint consumed this builder.
+func (c *context) paramBoundFor(builder string) bool {
+	for _, feeds := range c.boundBuilders {
+		if feeds[builder] {
+			return true
+		}
+	}
+	return false
+}
+
+// noteBuilderField accumulates a name written into a tracked builder so it can
+// be attached to the request the builder is passed to.
+func (c *context) noteBuilderField(builder, name string) {
+	if _, known := c.formData[builder]; !known {
+		return
+	}
+	c.formData[builder][name] = ""
+}
+
+// recordParamRef folds one occurrence into the classified report list.
+func (c *context) recordParamRef(name string, kind linker.ParamKind, owner linker.ParamOwner) {
+	if name == "" {
+		return
+	}
+	key := fmt.Sprintf("%s|%d|%d", name, kind, owner)
+	if i, seen := c.paramCount[key]; seen {
+		c.paramRefs[i].Count++
+		return
+	}
+	c.paramCount[key] = len(c.paramRefs)
+	c.paramRefs = append(c.paramRefs, linker.ParamRef{Name: name, Kind: kind, Owner: owner, Count: 1})
+}
+
+// bindBuilderToRequest records that a builder variable feeds an endpoint, and
+// attaches the names written into it as inferred query parameters.
+func (c *context) bindBuilderToRequest(builder, endpoint string) {
+	fields := c.formData[builder]
+	if len(fields) == 0 {
+		return
+	}
+	if c.boundBuilders == nil {
+		c.boundBuilders = map[string]map[string]bool{}
+	}
+	if c.boundBuilders[endpoint] == nil {
+		c.boundBuilders[endpoint] = map[string]bool{}
+	}
+	if c.boundBuilders[endpoint][builder] {
+		return
+	}
+	c.boundBuilders[endpoint][builder] = true
+	names := make([]string, 0, len(fields))
+	for n := range fields {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	kind := c.builderKind[builder]
+	if kind != linker.ParamForm {
+		// A URLSearchParams builder contributes query parameters.
+		for _, n := range names {
+			c.paramBound[endpoint] = append(c.paramBound[endpoint], contract.NameValue{Name: n})
+		}
+	}
+	// Promote exactly the names this builder contributed, so page-state
+	// parameters keep their own owner.
+	contributed := map[string]bool{}
+	for _, n := range names {
+		contributed[n] = true
+	}
+	for i := range c.paramRefs {
+		if contributed[c.paramRefs[i].Name] && c.paramRefs[i].Owner == linker.OwnerUnknown {
+			c.paramRefs[i].Owner = linker.OwnerRequest
+		}
+	}
+}
+
+// bindBuilderParams links the names written into a builder to the endpoints
+// whose argument list mentions that builder. The builder usually travels inside
+// an init object (fetch(url, {body: sp})), so the lookup is by token range
+// rather than by argument position.
+func (c *context) bindBuilderParams(tokens []token) {
+	if len(c.builderKind) == 0 {
+		return
+	}
+	for open, endpoint := range c.callURLIndex(tokens) {
+		closeIdx := matchParenFrom(tokens, open)
+		if closeIdx < 0 {
+			continue
+		}
+		for i := open + 1; i < closeIdx && i < len(tokens); i++ {
+			if tokens[i].typ != tokIdent {
+				continue
+			}
+			if _, tracked := c.builderKind[tokens[i].value]; tracked {
+				c.bindBuilderToRequest(tokens[i].value, endpoint)
+			}
+		}
+	}
+}
+
+// attachInferredQuery copies builder-derived names onto the matching observation
+// so the contract lists them without an observed value.
+func (c *context) attachInferredQuery() {
+	if len(c.paramBound) == 0 {
+		return
+	}
+	for i := range c.obs {
+		names := c.paramBound[c.obs[i].URL]
+		if len(names) == 0 {
+			for endpoint, fields := range c.paramBound {
+				if baseURLOf(endpoint) == baseURLOf(c.obs[i].URL) {
+					names = fields
+					break
+				}
+			}
+		}
+		if len(names) == 0 {
+			continue
+		}
+		c.obs[i].InferredQuery = append(c.obs[i].InferredQuery, names...)
 	}
 }
 
@@ -566,7 +840,13 @@ func sameCallPath(a, b string) bool {
 	if ab == bb {
 		return true
 	}
-	return strings.HasSuffix(urlPathOf(ab), urlPathOf(bb))
+	pa, pb := urlPathOf(ab), urlPathOf(bb)
+	// "/" is the path of every query-only call on the site root, so it must
+	// never match by suffix: / and /?svdom_georesolve=1 are distinct calls.
+	if len(pb) <= 1 || pa == pb {
+		return false
+	}
+	return strings.HasSuffix(pa, pb)
 }
 
 // urlPathOf returns the path of a URL, ignoring scheme and host.
@@ -747,6 +1027,21 @@ type context struct {
 	headersVar map[string]bool
 	// clientInst tracks axios.create({baseURL, headers}) instances.
 	clientInst map[string]initConfig
+	// builderKind records what each tracked builder variable is, so a .set()
+	// call can be classified as a query parameter or a form field.
+	builderKind map[string]linker.ParamKind
+	// builderFromLocation marks builders seeded from the page URL, whose
+	// parameters describe page state rather than an API request.
+	builderFromLocation map[string]bool
+	// paramRefs collects the classified parameter names for the report.
+	paramRefs []linker.ParamRef
+	// paramCount maps a name/kind/owner key to its index in paramRefs and
+	// folds repeated occurrences of the same name into one record.
+	paramCount map[string]int
+	// paramBound maps an endpoint to the names a builder contributed to it.
+	paramBound map[string][]contract.NameValue
+	// boundBuilders records which builder variables feed which endpoint.
+	boundBuilders map[string]map[string]bool
 	// inChain counts how many response-bearing continuations (then/done/…)
 	// wrap the call being analysed; a payload plus a continuation implies POST.
 	inChain int
@@ -790,21 +1085,25 @@ type xhrInfo struct {
 
 func newContext(sourceURL string, fullInfo bool) *context {
 	return &context{
-		sourceURL:  sourceURL,
-		fullInfo:   fullInfo,
-		vars:       map[string]string{},
-		props:      map[string]map[string]string{},
-		varInits:   map[string]expr{},
-		seen:       map[string]bool{},
-		obsSeen:    map[string]bool{},
-		respVar:    map[string]string{},
-		respElem:   map[string]string{},
-		respField:  map[string]map[string]string{},
-		xhrState:   map[string]*xhrInfo{},
-		reqVar:     map[string]initConfig{},
-		formData:   map[string]map[string]string{},
-		headersVar: map[string]bool{},
-		clientInst: map[string]initConfig{},
+		sourceURL:           sourceURL,
+		fullInfo:            fullInfo,
+		vars:                map[string]string{},
+		props:               map[string]map[string]string{},
+		varInits:            map[string]expr{},
+		seen:                map[string]bool{},
+		obsSeen:             map[string]bool{},
+		respVar:             map[string]string{},
+		respElem:            map[string]string{},
+		respField:           map[string]map[string]string{},
+		xhrState:            map[string]*xhrInfo{},
+		reqVar:              map[string]initConfig{},
+		formData:            map[string]map[string]string{},
+		headersVar:          map[string]bool{},
+		clientInst:          map[string]initConfig{},
+		builderKind:         map[string]linker.ParamKind{},
+		builderFromLocation: map[string]bool{},
+		paramCount:          map[string]int{},
+		paramBound:          map[string][]contract.NameValue{},
 	}
 }
 
@@ -1341,6 +1640,11 @@ func (c *context) analyzeVarDecl(d *varDecl) {
 				}
 			case "FormData", "URLSearchParams":
 				c.formData[d.name] = map[string]string{}
+				if id.name == "FormData" {
+					c.builderKind[d.name] = linker.ParamForm
+				} else {
+					c.builderKind[d.name] = linker.ParamQuery
+				}
 			case "Headers":
 				c.headersVar[d.name] = true
 				c.props[d.name] = map[string]string{}

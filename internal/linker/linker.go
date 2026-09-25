@@ -535,10 +535,63 @@ func isValidModuleSpecifier(s string) bool {
 }
 
 var (
-	tmplLiteralRegex  = regexp.MustCompile("`([^`\\\\]*(?:\\\\.[^`\\\\]*)*)`")
-	tmplInterpRegex   = regexp.MustCompile(`\$\{([^}]*)\}`)
-	queryParamBuildRe = regexp.MustCompile(`\.(?:set|append)\(\s*["']([A-Za-z_$][\w$]{0,63})["']`)
+	tmplLiteralRegex = regexp.MustCompile("`([^`\\\\]*(?:\\\\.[^`\\\\]*)*)`")
+	tmplInterpRegex  = regexp.MustCompile(`\$\{([^}]*)\}`)
 )
+
+// ParamKind separates a query parameter from a multipart form field: they are
+// built by the same ".set('/.append(' shape but mean very different things.
+type ParamKind int
+
+const (
+	ParamQuery ParamKind = iota
+	ParamForm
+	ParamUnknown
+)
+
+// ParamOwner says what the builder was writing into, which decides whether a
+// name belongs to an API request or to the page's own query string.
+type ParamOwner int
+
+const (
+	OwnerUnknown ParamOwner = iota
+	OwnerLocation
+	OwnerRequest
+)
+
+// ParamRef is one parameter name recovered from a request-building call, with
+// enough context to tell where it belongs.
+type ParamRef struct {
+	Name  string
+	Kind  ParamKind
+	Owner ParamOwner
+	Count int
+}
+
+func (p ParamRef) String() string { return p.Name }
+
+// KindLabel names the parameter kind for the report.
+func (p ParamRef) KindLabel() string {
+	switch p.Kind {
+	case ParamQuery:
+		return "query"
+	case ParamForm:
+		return "form"
+	}
+	return "unknown"
+}
+
+// OwnerLabel says what the builder feeds, which is the fact that decides
+// whether a name belongs to an API request or to the page's own query string.
+func (p ParamRef) OwnerLabel() string {
+	switch p.Owner {
+	case OwnerLocation:
+		return "page query state"
+	case OwnerRequest:
+		return "request"
+	}
+	return "unassigned"
+}
 
 // AnalyzeJS digs endpoint formation signals out of raw JS bundle text. It
 // returns two kinds of findings that structured parsing routinely misses on
@@ -547,19 +600,12 @@ var (
 //   - url-tmpl links: backtick templates with interpolation that look like a
 //     URL/endpoint (kept with {var} placeholders so the dynamic shape is not
 //     lost);
-//   - query parameter names discovered through the URLSearchParams-style
-//     .set()/.append() builders that assemble runtime request query strings.
+//   - parameter names discovered through the URLSearchParams-style
+//     .set()/.append() builders that assemble runtime query strings, each
+//     classified by kind and by the builder it is attached to.
 //
 // Nothing here performs network I/O: it is purely lexical analysis.
-func AnalyzeJS(js string, sourceURL string) (templates []Link, params []string) {
-	seenParam := make(map[string]bool)
-	for _, m := range queryParamBuildRe.FindAllStringSubmatch(js, -1) {
-		if len(m) < 2 || seenParam[m[1]] {
-			continue
-		}
-		seenParam[m[1]] = true
-		params = append(params, m[1])
-	}
+func AnalyzeJS(js string, sourceURL string) (templates []Link) {
 
 	seenTmpl := make(map[string]bool)
 	for _, m := range tmplLiteralRegex.FindAllStringSubmatch(js, -1) {
@@ -591,8 +637,36 @@ func AnalyzeJS(js string, sourceURL string) (templates []Link, params []string) 
 			Tag:       "url-tmpl",
 		})
 	}
-	return templates, params
+	return templates
 }
+
+// paramReceiverRe captures the object a builder call is invoked on.
+var paramReceiverRe = regexp.MustCompile(`([A-Za-z_$][\w$]{0,40})\s*\.\s*(?:set|append)\s*\(\s*["']([A-Za-z_$][\w$]{0,63})["']`)
+
+// paramWindowRe matches the request/builder constructors that decide who owns
+// a parameter. It is applied to the text surrounding a builder call.
+var (
+	paramRequestRe  = regexp.MustCompile(`\bfetch\s*\(|\bXMLHttpRequest\b|\.ajax\s*\(|\baxios\b|\$\s*\.\s*(?:get|post|getJSON)\s*\(`)
+	paramBuilderRe  = regexp.MustCompile(`\bURLSearchParams\b|\bnew\s+URL\s*\(`)
+	paramLocationRe = regexp.MustCompile(`\blocation\b|\bwindow\.location\b|\bdocument\.URL\b`)
+)
+
+// queryReceivers and formReceivers name the builders we can recognise. The
+// sets are intentionally generous: a missed name costs more than a name that
+// is filed under "unknown".
+var (
+	queryReceivers = map[string]bool{
+		"urlsearchparams": true, "searchparams": true, "params": true,
+		"query": true, "qs": true, "sp": true, "search": true,
+		"searchparams2": true, "usp": true, "urlparams": true,
+		"filter": true, "filters": true, "sort": true, "sorting": true,
+		"paging": true, "pager": true, "queryparams": true, "queryparams2": true,
+	}
+	formReceivers = map[string]bool{
+		"formdata": true, "form": true, "data": true, "fields": true,
+		"multipart": true, "payload": true, "fd": true,
+	}
+)
 
 // templatePlaceholder renders a single template interpolation as a readable
 // path placeholder ({id}, {page}, {le.status}) so a dynamic endpoint shape

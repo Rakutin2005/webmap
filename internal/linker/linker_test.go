@@ -92,16 +92,9 @@ func TestAnalyzeJS(t *testing.T) {
 		"const snap = `/api/admin/cameras/${id}/snapshot`;\n" +
 		"const chunk = `/assets/${e}.js`;\n" +
 		"const apiRoot = `${apiBase}/api/v2/counters`;\n"
-	templates, params := AnalyzeJS(js, "https://osi.example.com/assets/index.js")
-	wantParams := map[string]bool{"created_from": true, "created_to": true, "house_id": true}
-	if len(params) != len(wantParams) {
-		t.Errorf("params = %v, want %v", params, wantParams)
-	}
-	for _, p := range params {
-		if !wantParams[p] {
-			t.Errorf("unexpected param %q", p)
-		}
-	}
+	// Parameter names are recovered structurally by the JS analyzer now, so this
+	// pass only reports URL templates.
+	templates := AnalyzeJS(js, "https://osi.example.com/assets/index.js")
 
 	hrefs := make(map[string]bool)
 	for _, tm := range templates {

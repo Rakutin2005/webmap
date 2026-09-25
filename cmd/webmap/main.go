@@ -64,48 +64,105 @@ func poolObs(_ bool, obs []contract.Observation) {
 // URLSearchParams-style .set()/.append() builders in raw bundles and reveal
 // which query keys dynamic endpoints are assembled with.
 var (
-	fragMu       sync.Mutex
-	fragParams   []string
-	fragParamSet map[string]bool
+	fragMu     sync.Mutex
+	fragParams []linker.ParamRef
+	fragSeen   map[string]int
 )
 
-// poolFragments collects runtime query-parameter names so a single
-// "Dynamic query params" block can be printed at the end of the scan.
-func poolFragments(params []string) {
+// poolFragments collects parameter names recovered from request builders so a
+// single "Dynamic query params" block can be printed at the end of the scan.
+// Repeat occurrences of the same name are folded into one record.
+func poolFragments(params []linker.ParamRef) {
 	if len(params) == 0 {
 		return
 	}
 	fragMu.Lock()
 	defer fragMu.Unlock()
-	if fragParamSet == nil {
-		fragParamSet = make(map[string]bool)
+	if fragSeen == nil {
+		fragSeen = make(map[string]int)
 	}
 	for _, p := range params {
-		if !fragParamSet[p] {
-			fragParamSet[p] = true
-			fragParams = append(fragParams, p)
+		key := fmt.Sprintf("%s|%d|%d", p.Name, p.Kind, p.Owner)
+		if i, ok := fragSeen[key]; ok {
+			fragParams[i].Count += p.Count
+			continue
 		}
+		fragSeen[key] = len(fragParams)
+		fragParams = append(fragParams, p)
 	}
 }
 
-// renderFragmentFindings prints the runtime endpoint-formation findings that
-// raw-bundle analysis recovered (dynamic URL templates and query-param names).
-func renderFragmentFindings(cfg *config.Config) {
+// renderFragmentFindings prints the parameter names recovered from request
+// builders in the scanned code, grouped by what they are and what they feed, so
+// a name can be traced instead of appearing as an unexplained flat list. Names
+// already visible on discovered links are dropped: the link rows show them as
+// "(params: …)" and repeating them here only adds noise.
+func renderFragmentFindings(cfg *config.Config, displayLinks []linker.Link) {
 	fragMu.Lock()
-	params := append([]string(nil), fragParams...)
+	params := append([]linker.ParamRef(nil), fragParams...)
 	fragMu.Unlock()
 	if len(params) == 0 {
 		return
 	}
-	sort.Strings(params)
-	if cfg.Color {
-		fmt.Println(color.Colorize(color.Bold, "\n=== Dynamic query params ==="))
-	} else {
-		fmt.Println("\n=== Dynamic query params ===")
-	}
+	observed := observedParamNames(displayLinks)
+
+	// Group by owner first, then by kind: the owner is the fact that decides
+	// whether a name describes an API request or the page's own query string.
+	groups := map[string][]linker.ParamRef{}
 	for _, p := range params {
-		fmt.Printf("  %s\n", p)
+		if observed[p.Name] {
+			// The link rows already carry this key as "(params: …)".
+			continue
+		}
+		groups[p.OwnerLabel()+" / "+p.KindLabel()] = append(groups[p.OwnerLabel()+" / "+p.KindLabel()], p)
 	}
+	if len(groups) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	title := "\n=== Dynamic query params ==="
+	if cfg.Color {
+		title = color.Colorize(color.Bold, title)
+	}
+	fmt.Println(title)
+	for _, group := range keys {
+		refs := groups[group]
+		sort.Slice(refs, func(i, j int) bool { return refs[i].Name < refs[j].Name })
+		if cfg.Color {
+			fmt.Println("  " + color.Colorize(color.DarkCyan, group))
+		} else {
+			fmt.Println("  " + group)
+		}
+		for _, p := range refs {
+			line := fmt.Sprintf("    %-28s x%d", p.Name, p.Count)
+			if cfg.Color {
+				fmt.Println(color.Colorize(color.Dim, line))
+			} else {
+				fmt.Println(line)
+			}
+		}
+	}
+}
+
+// observedParamNames collects the query keys already reported on links, which
+// the crawler actually saw being requested.
+func observedParamNames(links []linker.Link) map[string]bool {
+	out := map[string]bool{}
+	for _, l := range links {
+		for _, p := range l.ParamVariants {
+			for _, part := range strings.Split(p.Query, "&") {
+				if i := strings.Index(part, "="); i > 0 {
+					out[part[:i]] = true
+				}
+			}
+		}
+	}
+	return out
 }
 
 // renderContractSection prints the inferred API contract section.
@@ -249,9 +306,9 @@ func main() {
 		enrichLinks(allLinks, f)
 		if cfg.AnalyzeJS {
 			if isJSURL(result.URL) {
-				jsLinks, jsObs := jsanalyzer.Parse(result.Body, result.URL, cfg.APIFull)
+				jsLinks, jsObs, fragParams := jsanalyzer.ParseWithParams(result.Body, result.URL, cfg.APIFull)
 				enrichLinks(jsLinks, f)
-				fragLinks, fragParams := linker.AnalyzeJS(result.Body, result.URL)
+				fragLinks := linker.AnalyzeJS(result.Body, result.URL)
 				enrichLinks(fragLinks, f)
 				allLinks = append(allLinks, jsLinks...)
 				allLinks = append(allLinks, fragLinks...)
@@ -265,9 +322,9 @@ func main() {
 					combined += inline + "\n"
 				}
 				if combined != "" {
-					jsLinks, jsObs := jsanalyzer.Parse(combined, result.URL, cfg.APIFull)
+					jsLinks, jsObs, fragParams := jsanalyzer.ParseWithParams(combined, result.URL, cfg.APIFull)
 					enrichLinks(jsLinks, f)
-					fragLinks, fragParams := linker.AnalyzeJS(combined, result.URL)
+					fragLinks := linker.AnalyzeJS(combined, result.URL)
 					enrichLinks(fragLinks, f)
 					allLinks = append(allLinks, jsLinks...)
 					allLinks = append(allLinks, fragLinks...)
@@ -290,7 +347,7 @@ func main() {
 		if cfg.APIContract {
 			renderContractSection(cfg)
 		}
-		renderFragmentFindings(cfg)
+		renderFragmentFindings(cfg, displayLinks)
 
 		p.IncrementRequest()
 		p.Increment()
@@ -336,7 +393,7 @@ func main() {
 	if cfg.APIContract {
 		renderContractSection(cfg)
 	}
-	renderFragmentFindings(cfg)
+	renderFragmentFindings(cfg, displayLinks)
 
 	if cfg.Markdown || cfg.Graphical {
 		g := graph.New(allLinks, cfg.URL)
@@ -992,9 +1049,9 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 					enrichLinks(links, f)
 					if cfg.AnalyzeJS {
 						if isJSURL(url) {
-							jsLinks, jsObs := jsanalyzer.Parse(result.Body, url, cfg.APIFull)
+							jsLinks, jsObs, fragParams := jsanalyzer.ParseWithParams(result.Body, url, cfg.APIFull)
 							enrichLinks(jsLinks, f)
-							fragLinks, fragParams := linker.AnalyzeJS(result.Body, url)
+							fragLinks := linker.AnalyzeJS(result.Body, url)
 							enrichLinks(fragLinks, f)
 							links = append(links, jsLinks...)
 							links = append(links, fragLinks...)
@@ -1007,9 +1064,9 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 								combined += inline + "\n"
 							}
 							if combined != "" {
-								jsLinks, jsObs := jsanalyzer.Parse(combined, url, cfg.APIFull)
+								jsLinks, jsObs, fragParams := jsanalyzer.ParseWithParams(combined, url, cfg.APIFull)
 								enrichLinks(jsLinks, f)
-								fragLinks, fragParams := linker.AnalyzeJS(combined, url)
+								fragLinks := linker.AnalyzeJS(combined, url)
 								enrichLinks(fragLinks, f)
 								links = append(links, jsLinks...)
 								links = append(links, fragLinks...)

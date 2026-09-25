@@ -48,6 +48,9 @@ type Observation struct {
 	// MethodInferred marks a verb that was derived from the call shape rather
 	// than stated by the code, so the contract can label it as a guess.
 	MethodInferred bool
+	// InferredQuery holds parameter names recovered from a request builder in
+	// the code. The name is known, no value was observed for it.
+	InferredQuery []NameValue
 }
 
 // ResponseField is one field path read off an endpoint's response, with the
@@ -206,6 +209,9 @@ func Infer(obs []Observation) []Endpoint {
 		}
 		for k, vs := range u.Query() {
 			e.Query = addValue(e.Query, k, vs...)
+		}
+		for _, q := range o.InferredQuery {
+			e.Query = addInferredField(e.Query, q)
 		}
 		mergeBody(e, o.Body, contentType(o.Headers))
 		for _, f := range o.ResponseFields {
@@ -380,6 +386,24 @@ func addFieldValue(list []Field, name, value string) []Field {
 		return append(list, Field{Name: name, Inferred: true})
 	}
 	return append(list, Field{Name: name, Values: []string{value}})
+}
+
+// addInferredField records a parameter name that only the code reveals. A real
+// observed value always wins over the inferred name-only entry.
+func addInferredField(list []Field, nv NameValue) []Field {
+	if nv.Name == "" {
+		return list
+	}
+	for i := range list {
+		if list[i].Name != nv.Name {
+			continue
+		}
+		if len(list[i].Values) == 0 {
+			list[i].Inferred = true
+		}
+		return list
+	}
+	return append(list, Field{Name: nv.Name, Inferred: true})
 }
 
 // isPlaceholderValue reports whether a value is the synthetic "<name>" marker.
@@ -988,10 +1012,15 @@ func renderFields(b *strings.Builder, fields []Field, col bool) {
 			}
 			b.WriteString(paint(col, color.DarkRed, "<"+f.Name+"> "+suffix))
 		default:
-			if f.Constant {
+			switch {
+			case f.Constant && f.ConstVal == "":
+				// A key present without a value (a flag): there is no value to
+				// show, so say what it is instead of claiming a constant.
+				b.WriteString(paint(col, color.DarkGray, "(flag)"))
+			case f.Constant:
 				b.WriteString(paint(col, color.Dim, Shield(f.Name, f.ConstVal)))
 				b.WriteString(paint(col, color.DarkGray, " (const)"))
-			} else {
+			default:
 				b.WriteString(paint(col, color.Dim, joinValues(f.Values)))
 			}
 		}
