@@ -19,15 +19,16 @@ func TestStructuralRequestDetection(t *testing.T) {
 		wantMethod string
 		inferred   bool
 	}{
-		{"minified identifier", `q("/api/a",{f:1});`, "/api/a", "POST", true},
+		// A payload alone is not a POST: every common client defaults to GET.
+		{"minified identifier", `q("/api/a",{f:1});`, "/api/a", "GET", true},
 		{"custom client object", `myHttp.post("/api/b",{id:1});`, "/api/b", "POST", false},
 		{"computed member", `api["post"]("/api/c",{id:1});`, "/api/c", "POST", false},
-		{"unknown verb", `transport("/api/d",{id:1});`, "/api/d", "POST", true},
+		{"unknown verb", `transport("/api/d",{id:1});`, "/api/d", "GET", true},
 		{"config object", `request({url:"/api/e", method:"PUT", data:{x:1}});`, "/api/e", "PUT", false},
 		{"config method DELETE", `zz.send({url:"/api/f", method:"DELETE"});`, "/api/f", "DELETE", false},
 		{"string concatenation", `get("/api/"+"g?x=1");`, "/api/g?x=1", "GET", false},
 		{"read verb puts payload in query", `client.load("/api/h",{page:2});`, "/api/h?page=2", "GET", false},
-		{"IIFE with inner helper", `(function(e,t){function n(r){return fetch(r,{method:"POST",body:t})}n("/api/i",{a:1});n("/api/j",{b:2})})(window);`, "/api/i", "POST", true},
+		{"IIFE with inner helper", `(function(e,t){function n(r){return fetch(r,{method:"POST",body:t})}n("/api/i",{a:1});n("/api/j",{b:2})})(window);`, "/api/i", "GET", true},
 		{"deeply nested config", `function a(){function b(){function c(){return $.ajax({url:"/api/k",type:"POST",data:{d:4}})}}}`, "/api/k", "POST", false},
 		{"unbalanced braces", `if(x){if(y){if(z){}}}` + `post("/api/l",{c:3});`, "/api/l", "POST", false},
 	}
@@ -79,4 +80,51 @@ func TestArrayOfURLsIsNotARequest(t *testing.T) {
 			t.Errorf("array literal reported as a request: %+v", o)
 		}
 	}
+}
+
+// Response schemas must be inferred without a parse tree: on minified bundles
+// the AST pass collapses, and the response shape is the most valuable part of
+// an AJAX contract.
+func TestResponseSchemaFromTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want []string
+	}{
+		{"promise chain", `fetch("/api/a").then(r=>r.json()).then(d=>{d.items.length; d.meta.total;});`,
+			[]string{"items.length", "meta.total"}},
+		{"jQuery trailing callback", `$.post("/api/b",{a:1}, function(res){ res.data.id; });`,
+			[]string{"data.id"}},
+		{"jQuery success property", `$.ajax({url:"/api/c", data:{a:1}, success:function(r){ r.rows.length; r.total; }});`,
+			[]string{"rows.length", "total"}},
+		{"deferred done", `client.get("/api/d").done(function(r){ r.list.length; });`,
+			[]string{"list.length"}},
+		{"minified bracket access", `e("/api/e").then(function(t){ t["meta"]["count"]; });`,
+			[]string{"meta", "meta.count"}},
+		{"no callback", `fetch("/api/f");`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, obs := Parse(tc.src, "https://h/", true)
+			got := map[string]bool{}
+			for _, o := range obs {
+				for _, f := range o.ResponseFields {
+					got[f.Path] = true
+				}
+			}
+			for _, want := range tc.want {
+				if !got[want] {
+					t.Errorf("response field %q missing, got %v", want, keys(got))
+				}
+			}
+		})
+	}
+}
+
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

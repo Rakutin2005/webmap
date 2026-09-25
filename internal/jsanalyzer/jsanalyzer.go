@@ -32,6 +32,7 @@ func Parse(jsContent string, sourceURL string, fullInfo bool) (result []linker.L
 	// analysis cannot reach — either the parser bailed out on the surrounding
 	// minified code, or the client object is an unrecognized short name.
 	ctx.scanRequestSites(tokens)
+	ctx.scanResponseFields(tokens)
 	ctx.scanCalls(tokens, jsContent)
 
 	// Robust fallback: many endpoints are built at runtime (e.g.
@@ -54,6 +55,16 @@ func (c *context) attachResponseFields() {
 	}
 	for i := range c.obs {
 		set := c.respField[c.obs[i].URL]
+		if len(set) == 0 {
+			// The AST may have resolved query parameters the token scan did not
+			// see, so fall back to matching the endpoint without its query.
+			for endpoint, fields := range c.respField {
+				if baseURLOf(endpoint) == baseURLOf(c.obs[i].URL) {
+					set = fields
+					break
+				}
+			}
+		}
 		if len(set) == 0 {
 			continue
 		}
@@ -240,8 +251,13 @@ func (c *context) scanRequestSites(tokens []token) {
 		if target == "" {
 			continue
 		}
-		if cfg.payloadIsQuery {
-			target = appendQuery(target, cfg.params)
+		if cfg.payloadIsQuery || (method == "GET" && cfg.hasPayload) {
+			if vals := scanObjectPairs(tokens, open+1, closeIdx, "data"); len(vals) > 0 {
+				target = appendQuery(target, vals)
+				cfg.body = ""
+			} else {
+				target = appendQuery(target, cfg.params)
+			}
 		}
 		headers := append([]contract.NameValue{}, cfg.headers...)
 		headers = append(headers, contentTypeHeader(cfg.contentType)...)
@@ -308,6 +324,30 @@ func matchParenFrom(tokens []token, openIdx int) int {
 		case ")", "]", "}":
 			depth--
 			if depth == 0 && tokens[i].value == ")" {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// matchBracket returns the index of the closer matching the bracket at openIdx,
+// for any bracket kind ("{" is closed by "}", not only by ")").
+func matchBracket(tokens []token, openIdx int) int {
+	if openIdx < 0 || openIdx >= len(tokens) || tokens[openIdx].typ != tokPunct {
+		return -1
+	}
+	depth := 0
+	for i := openIdx; i < len(tokens); i++ {
+		if tokens[i].typ != tokPunct {
+			continue
+		}
+		switch tokens[i].value {
+		case "(", "[", "{":
+			depth++
+		case ")", "]", "}":
+			depth--
+			if depth == 0 {
 				return i
 			}
 		}
@@ -402,6 +442,58 @@ func scanRequestInit(tokens []token, from, to int) requestInit {
 		}
 	}
 	return cfg
+}
+
+// scanObjectPairs reads the name/value pairs of an object literal argument
+// (jQuery's `data: {page: 2}`) from the token stream.
+func scanObjectPairs(tokens []token, from, to int, key string) []contract.NameValue {
+	var out []contract.NameValue
+	depth := 0
+	for i := from; i < to-1 && i < len(tokens); i++ {
+		if tokens[i].typ == tokPunct {
+			switch tokens[i].value {
+			case "(", "[", "{":
+				depth++
+			case ")", "]", "}":
+				depth--
+			}
+			continue
+		}
+		if tokens[i].value != key || depth != 1 {
+			continue
+		}
+		if tokens[i+1].typ != tokPunct || tokens[i+1].value != ":" {
+			continue
+		}
+		j := i + 2
+		if j < to && tokens[j].typ == tokPunct && tokens[j].value == "{" {
+			end := matchBracket(tokens, j)
+			if end < 0 {
+				end = to
+			}
+			out = append(out, scanFlatObject(tokens, j+1, end)...)
+			break
+		}
+	}
+	return out
+}
+
+// scanFlatObject reads the pairs of a brace-delimited object literal.
+func scanFlatObject(tokens []token, from, to int) []contract.NameValue {
+	var out []contract.NameValue
+	for i := from; i < to-1 && i < len(tokens); i++ {
+		if tokens[i].typ != tokIdent && tokens[i].typ != tokKeyword {
+			continue
+		}
+		if tokens[i+1].typ != tokPunct || tokens[i+1].value != ":" {
+			continue
+		}
+		out = append(out, contract.NameValue{
+			Name:  tokens[i].value,
+			Value: tokenLiteralValue(tokens[i+2]),
+		})
+	}
+	return out
 }
 
 // tokenLiteralValue returns the literal value of a token when it is a string,
@@ -1461,8 +1553,11 @@ const (
 )
 
 // inferMethod resolves the verb of a request call and reports how sure we are.
-// Nothing is guessed silently: a shape-based verdict is marked as inferred so
-// the contract can say so.
+// A payload alone is not evidence of a POST: fetch, XHR, axios and jQuery all
+// default to GET, and jQuery sends `data` as the query string unless a type is
+// given. Only an explicit field, a verb-shaped property, or a response
+// continuation that clearly follows a payload justify naming a verb, and
+// anything weaker is reported as inferred rather than asserted silently.
 func inferMethod(explicit, verb string, hasPayload, hasContinuation bool) (method, source string) {
 	if m := strings.ToUpper(strings.TrimSpace(explicit)); m != "" {
 		return m, srcExplicit
@@ -1470,16 +1565,12 @@ func inferMethod(explicit, verb string, hasPayload, hasContinuation bool) (metho
 	if m, ok := httpVerbs[strings.ToLower(verb)]; ok {
 		return m, srcVerb
 	}
-	if hasPayload {
+	// A payload consumed by a response continuation reads as a submission.
+	if hasPayload && hasContinuation {
 		return "POST", srcShape
 	}
-	if hasContinuation {
-		return "POST", srcShape
-	}
-	if hasPayload || verb == "" {
-		return "GET", srcDefault
-	}
-	return "", ""
+	// Otherwise fall back to the client default and say it is a guess.
+	return "GET", srcDefault
 }
 
 type callMatch int
@@ -1675,6 +1766,362 @@ func (c *context) bindResponse(args []expr, endpoint string) {
 }
 
 // recordRespField stores one response field path with its inferred kind.
+// responseCallbackMethods are the chain methods whose first callback argument
+// receives the response payload. Matching is by shape, not by library, so
+// promise chains, jQuery deferreds and custom wrappers all bind.
+var responseCallbackMethods = map[string]bool{
+	"then": true, "done": true, "success": true, "end": true,
+	"complete": true, "always": true, "ok": true,
+}
+
+// scanResponseFields infers response schemas by walking the token stream: for
+// every response-bearing continuation it binds the callback's first parameter
+// to the endpoint of the call it is attached to and records the field paths the
+// callback reads. Like the request scan it needs no parse tree, so it keeps
+// working on minified bundles where the AST pass collapses.
+func (c *context) scanResponseFields(tokens []token) {
+	callURL := c.callURLIndex(tokens)
+	if len(callURL) == 0 {
+		return
+	}
+	for i := range tokens {
+		t := tokens[i]
+		if t.typ != tokIdent || !responseCallbackMethods[t.value] {
+			continue
+		}
+		// Must be a member call: .then(...)
+		if i == 0 || tokens[i-1].typ != tokPunct || tokens[i-1].value != "." {
+			continue
+		}
+		if i+1 >= len(tokens) || tokens[i+1].typ != tokPunct || tokens[i+1].value != "(" {
+			continue
+		}
+		// The continuation is a sibling of the call it belongs to
+		// (client.get(url).done(…)), so walk back to the call's own "(".
+		endpoint, callOpen := "", -1
+		for k := i - 1; k >= 0; k-- {
+			if tokens[k].typ == tokPunct && tokens[k].value == ")" {
+				if o := matchingOpenParen(tokens, k); o >= 0 {
+					endpoint, callOpen = callURL[o], o
+				}
+				break
+			}
+		}
+		if endpoint == "" || callOpen < 0 {
+			continue
+		}
+		open := i + 1
+		closeIdx := matchParenFrom(tokens, open)
+		if closeIdx < 0 {
+			continue
+		}
+		cbFrom, cbTo, param := callbackBody(tokens, open+1, closeIdx)
+		if param == "" {
+			continue
+		}
+		for _, f := range memberPathsIn(tokens, cbFrom, cbTo, param) {
+			c.recordRespField(endpoint, f.path, f.kind)
+		}
+	}
+	// Callbacks passed inside the call itself: jQuery's $.post(url, data, cb)
+	// and the {success: cb} config property.
+	for openIdx, endpoint := range callURL {
+		closeIdx := matchParenFrom(tokens, openIdx)
+		if closeIdx < 0 {
+			continue
+		}
+		if cbFrom, cbTo, param := successCallback(tokens, openIdx+1, closeIdx); param != "" {
+			for _, f := range memberPathsIn(tokens, cbFrom, cbTo, param) {
+				c.recordRespField(endpoint, f.path, f.kind)
+			}
+		}
+	}
+}
+
+// successCallback locates a response callback passed as an argument of a
+// request call: the {success: fn} config property, or the trailing function
+// argument that jQuery-style helpers pass the response to.
+func successCallback(tokens []token, from, to int) (int, int, string) {
+	// Config property form: success: function (…) { … } / success: res => …
+	for i := from; i < to-1 && i < len(tokens); i++ {
+		if tokens[i].typ != tokIdent || !responseCallbackMethods[tokens[i].value] {
+			continue
+		}
+		if tokens[i+1].typ != tokPunct || tokens[i+1].value != ":" {
+			continue
+		}
+		j := i + 2
+		if start, end, param := functionBody(tokens, j, to); param != "" {
+			return start, end, param
+		}
+	}
+	// Trailing function argument form.
+	lastStart, lastEnd, lastParam := -1, -1, ""
+	for i := from; i < to && i < len(tokens); i++ {
+		if start, end, param := functionBody(tokens, i, to); param != "" {
+			lastStart, lastEnd, lastParam = start, end, param
+		}
+	}
+	return lastStart, lastEnd, lastParam
+}
+
+// functionBody matches a function or arrow at position i and returns the range
+// of its body plus the name of its first parameter.
+func functionBody(tokens []token, i, to int) (int, int, string) {
+	if i >= to || i >= len(tokens) {
+		return -1, -1, ""
+	}
+	// ident => …
+	if tokens[i].typ == tokIdent && i+1 < to && tokens[i+1].typ == tokOp && tokens[i+1].value == "=>" {
+		body := i + 2
+		if body < to && tokens[body].typ == tokPunct && tokens[body].value == "{" {
+			end := matchBracket(tokens, body)
+			if end < 0 || end > to {
+				end = to
+			}
+			return body + 1, end, tokens[i].value
+		}
+		return body, to, tokens[i].value
+	}
+	// function (…) { … }
+	if tokens[i].typ == tokKeyword && tokens[i].value == "function" {
+		j := i + 1
+		if j < to && tokens[j].typ == tokIdent { // named function expression
+			j++
+		}
+		if j < to && tokens[j].typ == tokPunct && tokens[j].value == "(" {
+			end := matchParenFrom(tokens, j)
+			if end < 0 {
+				return -1, -1, ""
+			}
+			param := callbackFirstParam(tokens, j, end)
+			if end+1 < to && tokens[end+1].typ == tokPunct && tokens[end+1].value == "{" {
+				bodyEnd := matchBracket(tokens, end+1)
+				if bodyEnd < 0 || bodyEnd > to {
+					bodyEnd = to
+				}
+				return end + 2, bodyEnd, param
+			}
+		}
+	}
+	return -1, -1, ""
+}
+
+// callURLIndex maps the opening parenthesis of each call to the endpoint it
+// requests, so a later continuation can be attributed back to it.
+func (c *context) callURLIndex(tokens []token) map[int]string {
+	out := map[int]string{}
+	var stack []int
+	for i := range tokens {
+		t := tokens[i]
+		if t.typ == tokPunct {
+			switch t.value {
+			case "(", "[", "{":
+				stack = append(stack, i)
+			case ")", "]", "}":
+				if len(stack) > 0 {
+					stack = stack[:len(stack)-1]
+				}
+			}
+			continue
+		}
+		if t.typ != tokString || len(stack) == 0 {
+			continue
+		}
+		open := -1
+		for k := len(stack) - 1; k >= 0; k-- {
+			if tokens[stack[k]].value == "(" {
+				open = stack[k]
+				break
+			}
+		}
+		if open < 0 {
+			continue
+		}
+		value, _ := tokenStringRun(tokens, i)
+		if value == "" || !looksLikeAPIEndpoint(value) {
+			continue
+		}
+		if _, seen := out[open]; seen {
+			continue
+		}
+		if u := resolveEndpoint(value, c.sourceURL); u != "" {
+			out[open] = u
+		}
+	}
+	return out
+}
+
+// matchingOpenParen returns the index of the "(" that the ")" at closeIdx closes.
+func matchingOpenParen(tokens []token, closeIdx int) int {
+	depth := 0
+	for i := closeIdx; i >= 0; i-- {
+		if tokens[i].typ != tokPunct {
+			continue
+		}
+		switch tokens[i].value {
+		case ")", "]", "}":
+			depth++
+		case "(", "[", "{":
+			depth--
+			if depth == 0 {
+				if tokens[i].value == "(" {
+					return i
+				}
+				return -1
+			}
+		}
+	}
+	return -1
+}
+
+// callbackBody matches a callback in any spelling (arrow, function expression)
+// and returns the range of its body plus the name of its payload parameter.
+func callbackBody(tokens []token, from, to int) (int, int, string) {
+	for i := from; i < to && i < len(tokens); i++ {
+		if start, end, param := functionBody(tokens, i, to); param != "" {
+			return start, end, param
+		}
+	}
+	return -1, -1, ""
+}
+
+// callbackFirstParam returns the name a callback binds its payload to.
+func callbackFirstParam(tokens []token, from, to int) string {
+	for i := from; i < to-1 && i < len(tokens); i++ {
+		t := tokens[i]
+		// (res => …) or (res, …) => …
+		if t.typ == tokPunct && t.value == "(" {
+			if i+2 < len(tokens) && tokens[i+1].typ == tokIdent {
+				return tokens[i+1].value
+			}
+			continue
+		}
+		// res => …
+		if t.typ == tokIdent && i+1 < len(tokens) &&
+			tokens[i+1].typ == tokOp && tokens[i+1].value == "=>" {
+			return t.value
+		}
+		// function (res) { … }
+		if t.typ == tokKeyword && t.value == "function" {
+			continue
+		}
+	}
+	return ""
+}
+
+// payloadReaders are the unmistakable response readers. Unlike the AST pass we
+// do not strip names like "data" or "value" here: they are far more often real
+// JSON fields than envelope properties.
+var payloadReaders = map[string]bool{
+	"json": true, "text": true, "blob": true, "arrayBuffer": true,
+}
+
+// respField is one inferred response field.
+type respField struct {
+	path string
+	kind string
+}
+
+// memberPathsIn collects the field paths a callback reads off the payload it
+// was handed, including collection elements: items.map(x => x.price) yields
+// "items" and "items[].price".
+func memberPathsIn(tokens []token, from, to int, root string) []respField {
+	var out []respField
+	seen := map[string]bool{}
+	for i := from; i < to && i < len(tokens); i++ {
+		if tokens[i].typ != tokIdent || tokens[i].value != root {
+			continue
+		}
+		path := ""
+		j := i + 1
+		for j < to && j < len(tokens) {
+			if tokens[j].typ != tokPunct {
+				break
+			}
+			switch tokens[j].value {
+			case ".":
+				if j+1 >= to {
+					return out
+				}
+				prop := tokens[j+1]
+				if prop.typ != tokIdent && prop.typ != tokKeyword {
+					return out
+				}
+				// A payload method is not a field.
+				if responseMethods[prop.value] || payloadReaders[prop.value] {
+					// The method ends the chain, but the field it was called
+					// on has still been read.
+					if path != "" && !seen[path] {
+						seen[path] = true
+						kind := "any"
+						if k, hinted := fieldKindHints[path]; hinted {
+							kind = k
+						}
+						out = append(out, respField{path: path, kind: kind})
+					}
+					return out
+				}
+				if path == "" {
+					path = prop.value
+				} else {
+					path += "." + prop.value
+				}
+				if k, hinted := fieldKindHints[prop.value]; hinted && !responseMethods[prop.value] {
+					if !seen[path] {
+						seen[path] = true
+						out = append(out, respField{path: path, kind: k})
+					}
+				}
+				j += 2
+				continue
+			case "[":
+				// t["key"] is a property read; t[expr] indexes the collection.
+				if j+1 < to && tokens[j+1].typ == tokString {
+					key := tokens[j+1].value
+					if path == "" {
+						path = key
+					} else {
+						path += "." + key
+					}
+					if !seen[path] {
+						seen[path] = true
+						out = append(out, respField{path: path, kind: "any"})
+					}
+					j += 3
+					continue
+				}
+				if path != "" {
+					idx := path + "[]"
+					if !seen[idx] {
+						seen[idx] = true
+						out = append(out, respField{path: idx, kind: "array"})
+					}
+				}
+				depth := 0
+				for ; j < to && j < len(tokens); j++ {
+					if tokens[j].typ == tokPunct && tokens[j].value == "[" {
+						depth++
+					} else if tokens[j].typ == tokPunct && tokens[j].value == "]" {
+						depth--
+						if depth == 0 {
+							j++
+							break
+						}
+					}
+				}
+				continue
+			}
+			break
+		}
+		if path != "" && !seen[path] {
+			seen[path] = true
+			out = append(out, respField{path: path, kind: "any"})
+		}
+	}
+	return out
+}
+
 func (c *context) recordRespField(endpoint, path, kind string) {
 	if path == "" || endpoint == "" {
 		return
@@ -4260,8 +4707,9 @@ func (c *context) applyGenericCall(args []expr, verb string) {
 		method = "GET"
 		inferred = true
 	}
-	// A payload on a read belongs in the query string.
-	if hasPayload && payloadIsQuery {
+	// A payload on a GET belongs in the query string — that is where jQuery and
+	// the fetch/axios defaults actually put it.
+	if hasPayload && (payloadIsQuery || method == "GET") {
 		if vals := c.paramExpr(args[1]); len(vals) > 0 {
 			url = appendQuery(url, vals)
 			cfg.body = ""

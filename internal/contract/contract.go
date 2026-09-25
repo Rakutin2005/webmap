@@ -387,13 +387,22 @@ func inferKind(name string, values []string) string {
 		return "token"
 	}
 	clean := make([]string, 0, len(values))
+	blanks := 0
 	for _, v := range values {
-		if v == "null" || v == "" {
+		if v == "null" {
+			continue
+		}
+		if v == "" {
+			blanks++
 			continue
 		}
 		clean = append(clean, v)
 	}
 	if len(clean) == 0 {
+		// "?debug" with no value is a flag, not a null.
+		if blanks > 0 {
+			return "bool"
+		}
 		return "null"
 	}
 	if allBool(clean) {
@@ -830,7 +839,16 @@ func render(eps []Endpoint, raw bool, col bool) string {
 		b.WriteString(paint(col, color.Dim, "  methods: "))
 		switch {
 		case e.Unobserved && len(e.Methods) == 0:
-			b.WriteString(paint(col, color.DarkGray, "unknown (endpoint path in code, no request resolved)"))
+			// State precisely what is known: the endpoint and, when present,
+			// its parameters, but no resolved request.
+			detail := "endpoint path in code"
+			if len(e.Query) > 0 {
+				detail += " with " + strconv.Itoa(len(e.Query)) + " query parameter(s)"
+			}
+			if len(e.Response) > 0 {
+				detail += ", response shape inferred"
+			}
+			b.WriteString(paint(col, color.DarkGray, "unknown ("+detail+", no request resolved)"))
 		default:
 			for i, m := range e.Methods {
 				if i > 0 {
