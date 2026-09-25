@@ -45,17 +45,28 @@ type ParamVariant struct {
 }
 
 type Link struct {
-	HREF          string
-	Resolved      string
-	Domain        string
-	Category      Category
-	LinkType      LinkType
-	Class         URLClass
+	HREF     string
+	Resolved string
+	Domain   string
+	Category Category
+	LinkType LinkType
+	Class    URLClass
+	// Depth is the crawl level at which this link was found: the page itself
+	// is 0, a link on it is 1, and so on. Zero also means "not from a crawl",
+	// which is the case for links recovered from a bundle or a sandbox run.
+	Depth         int
 	HasParams     bool
 	ParamVariants []ParamVariant
 	SourceURL     string
 	Tag           string
 	APIDetails    []APIDetail
+	// Synthesized marks a node a snapshot added so that a relation had
+	// something to point at: the page was fetched, but nothing ever linked to
+	// it, so no report that lists links has ever printed it as one. A reader
+	// that lists every node of a file would otherwise show a page the scan
+	// itself never listed, and the two reports would not be the same report.
+	// A crawl never sets it; only a stored set does.
+	Synthesized bool
 }
 
 var (
@@ -549,6 +560,18 @@ const (
 	ParamUnknown
 )
 
+func (k ParamKind) String() string {
+	switch k {
+	case ParamQuery:
+		return "query"
+	case ParamForm:
+		return "form"
+	case ParamUnknown:
+		return "unknown"
+	}
+	return "unknown"
+}
+
 // ParamOwner says what the builder was writing into, which decides whether a
 // name belongs to an API request or to the page's own query string.
 type ParamOwner int
@@ -558,6 +581,18 @@ const (
 	OwnerLocation
 	OwnerRequest
 )
+
+func (o ParamOwner) String() string {
+	switch o {
+	case OwnerLocation:
+		return "location"
+	case OwnerRequest:
+		return "request"
+	case OwnerUnknown:
+		return "unknown"
+	}
+	return "unknown"
+}
 
 // ParamRef is one parameter name recovered from a request-building call, with
 // enough context to tell where it belongs.
