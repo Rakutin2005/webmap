@@ -1072,11 +1072,16 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 			seenLinks[key] = true
 			allLinks = append(allLinks, link)
 
-			if isClassHidden(link.Class, cfg) {
+			// A script asset is fetched for analysis even when its URL class is
+			// hidden: a cache-busting query does not change the content, and
+			// CDN/WAF bundles routinely carry the API calls we are after. Page
+			// crawling keeps honouring the class filters.
+			crawlForJS := cfg.AnalyzeJS && link.Category == linker.CategoryWebAsset && isJSURL(link.HREF)
+			shouldCrawl := crawlForJS || link.Category == linker.CategoryWebPage
+			if !shouldCrawl {
 				continue
 			}
-			shouldCrawl := link.Category == linker.CategoryWebPage || (cfg.AnalyzeJS && link.Category == linker.CategoryWebAsset && isJSURL(link.HREF))
-			if !shouldCrawl {
+			if isClassHidden(link.Class, cfg) && !crawlForJS {
 				continue
 			}
 			resolved := link.Resolved
@@ -1987,7 +1992,13 @@ func extractInlineScripts(html string) []string {
 	return scripts
 }
 
+// isJSURL reports whether a URL points at a script asset. The query string is
+// ignored: cache-busting references (?v=…, ?1789992068) are extremely common
+// and the path still ends in .js.
 func isJSURL(u string) bool {
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		u = u[:i]
+	}
 	lower := strings.ToLower(u)
 	return strings.HasSuffix(lower, ".js") ||
 		strings.HasSuffix(lower, ".mjs") ||
