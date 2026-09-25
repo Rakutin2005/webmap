@@ -42,6 +42,9 @@ type Observation struct {
 	// ResponseFields holds the response schema paths statically inferred from
 	// the code that consumes the endpoint's response.
 	ResponseFields []ResponseField
+	// EndpointOnly marks an endpoint path found in the code without a
+	// resolvable request around it: no method, parameters or calls are known.
+	EndpointOnly bool
 }
 
 // ResponseField is one field path read off an endpoint's response, with the
@@ -81,6 +84,9 @@ type Endpoint struct {
 	// Response is the statically inferred response schema of this endpoint.
 	Response []ResponseField
 	Calls    int
+	// Unobserved marks an endpoint that was only seen as a path in the code:
+	// no request was resolved, so method/params/calls are unknown.
+	Unobserved bool
 	// Raw holds one masked rendition per unique request (context/evidence).
 	Raw []string
 }
@@ -174,8 +180,12 @@ func Infer(obs []Observation) []Endpoint {
 			e = &Endpoint{Path: path}
 			groups[path] = e
 		}
-		e.Methods = addString(e.Methods, strings.ToUpper(o.Method))
-		e.Calls++
+		if o.EndpointOnly {
+			e.Unobserved = true
+		} else {
+			e.Methods = addString(e.Methods, strings.ToUpper(o.Method))
+			e.Calls++
+		}
 		for _, h := range o.Headers {
 			e.Headers = addHeader(e.Headers, h)
 		}
@@ -193,6 +203,9 @@ func Infer(obs []Observation) []Endpoint {
 
 	out := make([]Endpoint, 0, len(groups))
 	for _, e := range groups {
+		// An endpoint only counts as unobserved when no request was resolved
+		// for it; a bare path literal must not mask real captured calls.
+		e.Unobserved = e.Unobserved && len(e.Methods) == 0 && e.Calls == 0
 		e.Query = finalizeFields(e.Query)
 		e.Headers = finalizeFields(e.Headers)
 		for i := range e.Bodies {
@@ -803,15 +816,27 @@ func render(eps []Endpoint, raw bool, col bool) string {
 		b.WriteString(paintPath(col, e.Path))
 		b.WriteString("\n")
 		b.WriteString(paint(col, color.Dim, "  methods: "))
-		for i, m := range e.Methods {
-			if i > 0 {
-				b.WriteString(", ")
+		switch {
+		case e.Unobserved && len(e.Methods) == 0:
+			b.WriteString(paint(col, color.DarkGray, "unknown (endpoint path in code, no request resolved)"))
+		default:
+			for i, m := range e.Methods {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(paint(col, methodColor(m), m))
 			}
-			b.WriteString(paint(col, methodColor(m), m))
+			if e.Unobserved {
+				b.WriteString(paint(col, color.DarkGray, " (unobserved)"))
+			}
 		}
 		b.WriteString("\n")
 		b.WriteString(paint(col, color.Dim, "  calls:   "))
-		b.WriteString(paint(col, color.DarkGray, strconv.Itoa(e.Calls)))
+		if e.Unobserved {
+			b.WriteString(paint(col, color.DarkGray, "n/a"))
+		} else {
+			b.WriteString(paint(col, color.DarkGray, strconv.Itoa(e.Calls)))
+		}
 		b.WriteString("\n")
 		b.WriteString(paint(col, color.Dim, "  type:    "))
 		renderDataType(&b, e, col)

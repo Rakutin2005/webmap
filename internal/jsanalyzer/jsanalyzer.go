@@ -40,6 +40,7 @@ func Parse(jsContent string, sourceURL string, fullInfo bool) (result []linker.L
 	// on tokens (not the AST) so it works even when parsing bails out on minified
 	// or exotic syntax.
 	ctx.harvestTokens(tokens)
+	ctx.flushXHR()
 	ctx.attachResponseFields()
 	return ctx.links, ctx.obs
 }
@@ -107,6 +108,26 @@ func (c *context) harvestString(s string, traced []string) {
 		}
 	}
 	c.addLink(s, "js-str", "string-literal", "")
+	c.addEndpointObs(s)
+}
+
+// addEndpointObs records that an endpoint path exists in the bundle without a
+// resolvable request around it (a bare string literal). It reaches the
+// contracts section as an unobserved endpoint instead of being invisible there.
+func (c *context) addEndpointObs(rawURL string) {
+	if len(c.obs) >= maxObs {
+		return
+	}
+	u := resolveEndpoint(strings.TrimSpace(rawURL), c.sourceURL)
+	if u == "" {
+		return
+	}
+	key := "endpoint|" + u
+	if c.obsSeen[key] {
+		return
+	}
+	c.obsSeen[key] = true
+	c.obs = append(c.obs, contract.Observation{URL: u, EndpointOnly: true})
 }
 
 // tokenCallMethods maps a member name on an HTTP client object to the request
@@ -292,6 +313,18 @@ type context struct {
 	respVar   map[string]string
 	respElem  map[string]string
 	respField map[string]map[string]string
+	// xhrState tracks raw XMLHttpRequest objects by variable name so open(),
+	// setRequestHeader() and send() can be correlated into one AJAX contract.
+	xhrState map[string]*xhrInfo
+}
+
+// xhrInfo is the accumulated state of one raw XMLHttpRequest.
+type xhrInfo struct {
+	url     string
+	method  string
+	headers []contract.NameValue
+	body    string
+	sent    bool
 }
 
 func newContext(sourceURL string, fullInfo bool) *context {
@@ -306,6 +339,7 @@ func newContext(sourceURL string, fullInfo bool) *context {
 		respVar:   map[string]string{},
 		respElem:  map[string]string{},
 		respField: map[string]map[string]string{},
+		xhrState:  map[string]*xhrInfo{},
 	}
 }
 
@@ -625,6 +659,96 @@ func (c *context) analyzeVarDecl(d *varDecl) {
 	if fe, ok := d.init.(*funcExpr); ok && fe.body != nil {
 		c.analyze(fe.body.stmts)
 	}
+	// var x = new XMLHttpRequest(): start tracking the instance so its
+	// open()/setRequestHeader()/send() calls fold into one AJAX contract.
+	if ne, ok := d.init.(*newExpr); ok && isXMLHttpRequestExpr(ne.callee) {
+		c.xhrState[d.name] = &xhrInfo{}
+	}
+}
+
+// isXMLHttpRequestExpr reports whether a `new` callee is XMLHttpRequest.
+func isXMLHttpRequestExpr(callee expr) bool {
+	id, ok := callee.(*identExpr)
+	return ok && id.name == "XMLHttpRequest"
+}
+
+// ajaxBody builds the request body of a raw XHR send(). Form posts assembled
+// by string concatenation ("a="+enc(x)+"&b="+enc(y)) are not evaluable, so the
+// parameter names are recovered and rendered as placeholders — that is the part
+// of an AJAX contract that carries meaning.
+func (c *context) ajaxBody(arg expr, headers []contract.NameValue) string {
+	if arg == nil {
+		return ""
+	}
+	if formEncoded(headers) {
+		if names := c.formFieldNames(arg); len(names) > 0 {
+			parts := make([]string, 0, len(names))
+			for _, n := range names {
+				parts = append(parts, n+"=<"+n+">")
+			}
+			return strings.Join(parts, "&")
+		}
+	}
+	return c.bodyExpr(arg)
+}
+
+// formEncoded reports whether the declared content type is form-urlencoded (or
+// absent, in which case a name=value concatenation still reads as a form).
+func formEncoded(headers []contract.NameValue) bool {
+	for _, h := range headers {
+		if !strings.EqualFold(h.Name, "content-type") {
+			continue
+		}
+		v := strings.ToLower(h.Value)
+		return strings.Contains(v, "x-www-form-urlencoded")
+	}
+	return true
+}
+
+// formFieldNames collects the parameter names of a concatenated form body.
+func (c *context) formFieldNames(e expr) []string {
+	var operands []expr
+	flattenConcat(e, &operands)
+	if len(operands) < 1 {
+		return nil
+	}
+	var b strings.Builder
+	for _, op := range operands {
+		if s, ok := op.(*stringExpr); ok {
+			b.WriteString(s.value)
+			continue
+		}
+		b.WriteString("\x00")
+	}
+	joined := b.String()
+	if !strings.Contains(joined, "=") {
+		return nil
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, part := range strings.Split(joined, "&") {
+		name := strings.TrimSpace(part)
+		if i := strings.Index(name, "="); i >= 0 {
+			name = strings.TrimSpace(name[:i])
+		}
+		name = strings.Trim(name, "\"'` \x00")
+		if name == "" || strings.ContainsAny(name, "\x00()[]+ ") || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	return names
+}
+
+// flattenConcat collects the operands of a left-leaning `+` chain.
+func flattenConcat(e expr, out *[]expr) {
+	if be, ok := e.(*binaryExpr); ok && be.op == "+" {
+		flattenConcat(be.left, out)
+		flattenConcat(be.right, out)
+		return
+	}
+	*out = append(*out, e)
 }
 
 var configPropKeys = map[string]bool{
@@ -783,6 +907,33 @@ var chainMethods = map[string]bool{
 
 func (c *context) analyzeCall(ce *callExpr) {
 	if me, ok := ce.callee.(*memberExpr); ok {
+		// Raw XHR lifecycle: correlate setRequestHeader/send with the open()
+		// recorded for the same object. Handled before the chain-method
+		// shortcut below, which would otherwise swallow send().
+		if name, isIdent := me.object.(*identExpr); isIdent {
+			if st, tracked := c.xhrState[name.name]; tracked {
+				switch me.property {
+				case "setRequestHeader":
+					if len(ce.args) >= 2 {
+						st.headers = append(st.headers, contract.NameValue{
+							Name:  c.evalExpr(ce.args[0]),
+							Value: c.evalExpr(ce.args[1]),
+						})
+					}
+					return
+				case "send":
+					if len(ce.args) > 0 {
+						st.body = c.ajaxBody(ce.args[0], st.headers)
+					}
+					st.sent = true
+					c.emitXHR(name.name, st)
+					return
+				case "abort":
+					delete(c.xhrState, name.name)
+					return
+				}
+			}
+		}
 		if chainMethods[me.property] {
 			// fetch(url).then(r => r.json()) / client.get(url).then(res => …):
 			// bind the callback parameter to the endpoint so the fields read
@@ -3304,9 +3455,48 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 				httpMethod = c.evalExpr(args[0])
 			}
 		}
-		if url != "" {
-			c.addLink(url, "js-api", "XHR.open", httpMethod)
-			c.addObs(url, httpMethod, nil, "")
+		if url == "" {
+			return
 		}
+		// objName arrives as the full call path ("request.open"); the tracked
+		// XHR is keyed by the variable name alone.
+		recv := objName
+		if i := strings.Index(recv, "."); i > 0 {
+			recv = recv[:i]
+		}
+		if st, tracked := c.xhrState[recv]; tracked {
+			// Hold the observation until send() so the headers and body set on
+			// the same object end up in the same contract.
+			st.url = url
+			st.method = stringOr(httpMethod, "GET")
+			return
+		}
+		c.addLink(url, "js-api", "XHR.open", httpMethod)
+		c.addObs(url, httpMethod, nil, "")
+	}
+}
+
+// emitXHR records the contract observation for a tracked XMLHttpRequest.
+func (c *context) emitXHR(name string, st *xhrInfo) {
+	delete(c.xhrState, name)
+	if st.url == "" {
+		return
+	}
+	method := stringOr(st.method, "GET")
+	c.addLink(st.url, "js-api", "XHR.send", method)
+	c.addObs(st.url, method, st.headers, st.body)
+}
+
+// flushXHR records tracked requests whose send() was never reached (for
+// example a request built in a function the analyzer cannot follow), so the
+// endpoint still shows up in the contracts.
+func (c *context) flushXHR() {
+	names := make([]string, 0, len(c.xhrState))
+	for name := range c.xhrState {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		c.emitXHR(name, c.xhrState[name])
 	}
 }

@@ -379,3 +379,56 @@ axios.get('/api/complexes-map').then(res => {
 		t.Errorf("complexes-map data.count = %q, want number", mapFields["data.count"])
 	}
 }
+
+// A raw XMLHttpRequest must fold open()/setRequestHeader()/send() into one
+// observation: the AJAX contract needs the method, the content type and the
+// form parameter names, none of which were captured before.
+func TestObservationsXHRFullLifecycle(t *testing.T) {
+	_, obs := Parse(`var request = new XMLHttpRequest();
+request.open("POST", "/bitrix/tools/conversion/ajax_counter.php", true);
+request.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+request.send("SITE_ID="+encodeURIComponent("s1")+"&sessid="+encodeURIComponent(BX.bitrix_sessid()));`,
+		"https://svoydom.kz/", true)
+	if len(obs) != 1 {
+		t.Fatalf("expected a single folded observation, got %d: %+v", len(obs), obs)
+	}
+	o := obs[0]
+	if o.Method != "POST" {
+		t.Errorf("method = %q, want POST", o.Method)
+	}
+	if len(o.Headers) != 1 || o.Headers[0].Name != "Content-type" {
+		t.Errorf("headers = %+v, want Content-type", o.Headers)
+	}
+	for _, field := range []string{"SITE_ID", "sessid"} {
+		if !strings.Contains(o.Body, field+"=<"+field+">") {
+			t.Errorf("body %q missing form field %q", o.Body, field)
+		}
+	}
+}
+
+func TestObservationsXHRSendWithoutOpen(t *testing.T) {
+	// An XHR built in a helper may never reach open() in this file; the URL is
+	// still known, so the endpoint must survive.
+	_, obs := Parse(`var x = new XMLHttpRequest(); x.send("a=1");`,
+		"https://example.com/app.js", true)
+	for _, o := range obs {
+		if o.URL == "https://example.com/app.js" {
+			t.Errorf("unexpected observation without a URL: %+v", o)
+		}
+	}
+}
+
+func TestFormFieldNamesIgnoresJSONBody(t *testing.T) {
+	c := newContext("https://example.com/", true)
+	_, obs := Parse(`var x = new XMLHttpRequest();
+x.open("POST", "/api/save");
+x.setRequestHeader("Content-Type", "application/json");
+x.send(JSON.stringify({id: 1, name: "a"}));`, "https://example.com/app.js", true)
+	if len(obs) != 1 {
+		t.Fatalf("expected 1 observation, got %d", len(obs))
+	}
+	if strings.Contains(obs[0].Body, "id=<id>") {
+		t.Errorf("JSON body must not be turned into form fields: %q", obs[0].Body)
+	}
+	_ = c
+}

@@ -2,6 +2,7 @@ package progress
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -73,7 +74,7 @@ func (p *ProgressBar) drawLoop(done chan struct{}) {
 		select {
 		case <-done:
 			p.drawOnce()
-			fmt.Println()
+			fmt.Fprintln(os.Stderr)
 			return
 		case <-p.stopChan:
 			return
@@ -115,7 +116,7 @@ func (p *ProgressBar) drawOnce() {
 	}
 	p.lastLine = output
 
-	fmt.Print(output)
+	fmt.Fprint(os.Stderr, output)
 }
 
 func (p *ProgressBar) Finish() {
@@ -123,5 +124,5 @@ func (p *ProgressBar) Finish() {
 	target := atomic.LoadInt64(&p.target)
 	requests := atomic.LoadInt64(&p.requests)
 
-	fmt.Printf("\r[%s] %d/%d (100%%) reqs=%d\n", strings.Repeat("#", p.width), completed, target, requests)
+	fmt.Fprintf(os.Stderr, "\r[%s] %d/%d (100%%) reqs=%d\n", strings.Repeat("#", p.width), completed, target, requests)
 }

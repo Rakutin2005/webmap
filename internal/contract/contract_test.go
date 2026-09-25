@@ -238,3 +238,30 @@ func TestRenderColoredKeepsTokenMasking(t *testing.T) {
 }
 
 func containsStrings(s string, subs string) bool { return strings.Contains(s, subs) }
+
+func TestUnobservedEndpoint(t *testing.T) {
+	eps := Infer([]Observation{
+		{URL: "https://h/a.php", EndpointOnly: true},
+	})
+	if len(eps) != 1 {
+		t.Fatalf("expected 1 endpoint, got %d", len(eps))
+	}
+	if !eps[0].Unobserved {
+		t.Error("expected Unobserved")
+	}
+	if out := Render(eps, false); !strings.Contains(out, "unknown (endpoint path in code") {
+		t.Errorf("missing unobserved marker:\n%s", out)
+	}
+
+	// A bare path literal must not mask a real captured request.
+	eps = Infer([]Observation{
+		{URL: "https://h/a.php", EndpointOnly: true},
+		{URL: "https://h/a.php", Method: "POST"},
+	})
+	if eps[0].Unobserved {
+		t.Error("observed endpoint must not be marked unobserved")
+	}
+	if eps[0].Calls != 1 || len(eps[0].Methods) != 1 || eps[0].Methods[0] != "POST" {
+		t.Errorf("real call lost: %+v", eps[0])
+	}
+}
