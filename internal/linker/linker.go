@@ -562,10 +562,18 @@ const (
 // ParamRef is one parameter name recovered from a request-building call, with
 // enough context to tell where it belongs.
 type ParamRef struct {
-	Name  string
-	Kind  ParamKind
-	Owner ParamOwner
-	Count int
+	// Endpoints lists the request endpoints a recovered name was bound to.
+	// Without it a name is a bare string: it says what exists, but not which
+	// URL it belongs to.
+	Endpoints []string
+	// Carrier names the URL expression a name travels through when the code
+	// never spells the endpoint out ("this.ajaxUrl"). It is what can be said
+	// truthfully: the request exists, its literal address does not.
+	Carrier string
+	Name    string
+	Kind    ParamKind
+	Owner   ParamOwner
+	Count   int
 }
 
 func (p ParamRef) String() string { return p.Name }

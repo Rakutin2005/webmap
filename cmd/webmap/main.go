@@ -67,12 +67,16 @@ var (
 	fragMu     sync.Mutex
 	fragParams []linker.ParamRef
 	fragSeen   map[string]int
+	// fragSources counts the documents a name was recovered from. Summing
+	// per-document hits instead would read as "used 396 times", which is a
+	// property of the crawl, not of the code.
+	fragSources []map[string]bool
 )
 
 // poolFragments collects parameter names recovered from request builders so a
 // single "Dynamic query params" block can be printed at the end of the scan.
 // Repeat occurrences of the same name are folded into one record.
-func poolFragments(params []linker.ParamRef) {
+func poolFragments(params []linker.ParamRef, source string) {
 	if len(params) == 0 {
 		return
 	}
@@ -82,14 +86,53 @@ func poolFragments(params []linker.ParamRef) {
 		fragSeen = make(map[string]int)
 	}
 	for _, p := range params {
-		key := fmt.Sprintf("%s|%d|%d", p.Name, p.Kind, p.Owner)
+		// One name, one line. The same name can be seen in several scripts
+		// with different certainty; the strongest attribution wins and the
+		// endpoints are unioned, so the report never shows a name twice with a
+		// weaker answer next to a stronger one.
+		key := fmt.Sprintf("%s|%d", p.Name, p.Kind)
 		if i, ok := fragSeen[key]; ok {
-			fragParams[i].Count += p.Count
+			cur := &fragParams[i]
+			if p.Owner > cur.Owner {
+				cur.Owner = p.Owner
+				cur.Carrier = p.Carrier
+			} else if p.Carrier != "" && cur.Carrier == "" {
+				cur.Carrier = p.Carrier
+			}
+			// A known endpoint is the strongest statement there is: the name
+			// is not merely page state any more.
+			if len(p.Endpoints) > 0 {
+				cur.Owner = linker.OwnerRequest
+			}
+			for _, ep := range p.Endpoints {
+				if !containsEndpoint(cur.Endpoints, ep) {
+					cur.Endpoints = append(cur.Endpoints, ep)
+				}
+			}
+			if source != "" {
+				fragSources[i][source] = true
+			}
 			continue
 		}
 		fragSeen[key] = len(fragParams)
+		if len(p.Endpoints) > 0 {
+			p.Owner = linker.OwnerRequest
+		}
 		fragParams = append(fragParams, p)
+		fragSources = append(fragSources, map[string]bool{})
+		if source != "" {
+			fragSources[len(fragSources)-1][source] = true
+		}
 	}
+}
+
+func containsEndpoint(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // renderFragmentFindings prints the parameter names recovered from request
@@ -100,6 +143,13 @@ func poolFragments(params []linker.ParamRef) {
 func renderFragmentFindings(cfg *config.Config, displayLinks []linker.Link) {
 	fragMu.Lock()
 	params := append([]linker.ParamRef(nil), fragParams...)
+	sources := make([]map[string]bool, len(fragSources))
+	for i, m := range fragSources {
+		sources[i] = make(map[string]bool, len(m))
+		for k := range m {
+			sources[i][k] = true
+		}
+	}
 	fragMu.Unlock()
 	if len(params) == 0 {
 		return
@@ -133,20 +183,80 @@ func renderFragmentFindings(cfg *config.Config, displayLinks []linker.Link) {
 	for _, group := range keys {
 		refs := groups[group]
 		sort.Slice(refs, func(i, j int) bool { return refs[i].Name < refs[j].Name })
+		header := group
+		if strings.HasPrefix(group, linker.ParamRef{Owner: linker.OwnerUnknown}.OwnerLabel()) {
+			header += "  (no request builder found - not attributed to any URL)"
+		}
 		if cfg.Color {
-			fmt.Println("  " + color.Colorize(color.DarkCyan, group))
+			fmt.Println("  " + color.Colorize(color.DarkCyan, header))
 		} else {
-			fmt.Println("  " + group)
+			fmt.Println("  " + header)
 		}
 		for _, p := range refs {
-			line := fmt.Sprintf("    %-28s x%d", p.Name, p.Count)
-			if cfg.Color {
-				fmt.Println(color.Colorize(color.Dim, line))
-			} else {
-				fmt.Println(line)
-			}
+			fmt.Println(colorizeLine(cfg, renderParamRef(p, sources[fragSeen[paramKey(p)]])))
 		}
 	}
+}
+
+func paramKey(p linker.ParamRef) string {
+	return fmt.Sprintf("%s|%d", p.Name, p.Kind)
+}
+
+func colorizeLine(cfg *config.Config, line string) string {
+	if cfg.Color {
+		return color.Colorize(color.Dim, line)
+	}
+	return line
+}
+
+// renderParamRef formats one recovered parameter: how many documents it was
+// found in, which endpoint it feeds, or - for page state, which has no
+// endpoint - where it was seen. A name with no carrier at all says so.
+func renderParamRef(p linker.ParamRef, sources map[string]bool) string {
+	docs := len(sources)
+	unit := "docs"
+	if docs == 1 {
+		unit = "doc "
+	}
+	line := fmt.Sprintf("    %-26s %3d %s", p.Name, docs, unit)
+	if len(p.Endpoints) > 0 {
+		line += "  -> " + strings.Join(p.Endpoints, ", ")
+		return line
+	}
+	if p.Carrier != "" {
+		line += "  -> " + p.Carrier + " (endpoint set elsewhere)"
+		return line
+	}
+	if docs > 0 && docs <= 3 {
+		names := make([]string, 0, docs)
+		for src := range sources {
+			names = append(names, shortSource(src))
+		}
+		sort.Strings(names)
+		line += "  in " + strings.Join(names, ", ")
+	}
+	return line
+}
+
+// shortSource trims a source URL down to something that fits on one report
+// line: no scheme, no host, and no query string.
+func shortSource(raw string) string {
+	s := raw
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+		if j := strings.Index(s, "/"); j >= 0 {
+			s = s[j:]
+		} else {
+			s = "/"
+		}
+	}
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 44 {
+		s = "..." + s[len(s)-41:]
+	}
+	return s
 }
 
 // observedParamNames collects the query keys already reported on links, which
@@ -313,7 +423,7 @@ func main() {
 				allLinks = append(allLinks, jsLinks...)
 				allLinks = append(allLinks, fragLinks...)
 				poolObs(true, jsObs)
-				poolFragments(fragParams)
+				poolFragments(fragParams, result.URL)
 			}
 			ct := result.Headers.Get("Content-Type")
 			if strings.Contains(ct, "html") || strings.Contains(ct, "text/html") {
@@ -329,7 +439,7 @@ func main() {
 					allLinks = append(allLinks, jsLinks...)
 					allLinks = append(allLinks, fragLinks...)
 					poolObs(true, jsObs)
-					poolFragments(fragParams)
+					poolFragments(fragParams, result.URL)
 				}
 			}
 		}
@@ -1056,7 +1166,7 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 							links = append(links, jsLinks...)
 							links = append(links, fragLinks...)
 							poolObs(true, jsObs)
-							poolFragments(fragParams)
+							poolFragments(fragParams, url)
 						}
 						if strings.Contains(contentType, "html") || strings.Contains(contentType, "text/html") {
 							var combined string
@@ -1071,7 +1181,7 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 								links = append(links, jsLinks...)
 								links = append(links, fragLinks...)
 								poolObs(true, jsObs)
-								poolFragments(fragParams)
+								poolFragments(fragParams, url)
 							}
 						}
 					}

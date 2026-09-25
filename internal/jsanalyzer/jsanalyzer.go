@@ -37,11 +37,17 @@ func ParseWithParams(jsContent string, sourceURL string, fullInfo bool) (result 
 	p := newParser(tokens)
 	stmts := p.parseProgram()
 
+	// Declarations first, then fields, then requests: a request can only be
+	// attributed once the builders and addresses around it are known, and in
+	// real code they are often written after the request itself.
+	ctx.collectDeclarations(stmts)
+	ctx.scanParamBuilders(tokens)
+	ctx.linkScopeFields()
 	ctx.analyze(stmts)
+	ctx.resolvePending()
 
 	// Token-level passes for signals the AST analysis cannot reach: minified
 	// code where the parser gives up, and clients with arbitrary names.
-	ctx.scanParamBuilders(tokens)
 	ctx.scanRequestSites(tokens)
 	ctx.scanResponseFields(tokens)
 	ctx.bindBuilderParams(tokens)
@@ -249,27 +255,543 @@ func (c *context) noteBuilderField(builder, name string) {
 		return
 	}
 	c.formData[builder][name] = ""
+	if fn := c.builderScope[builder]; fn != "" {
+		c.noteScopeField(fn, name)
+	}
 }
 
 // recordParamRef folds one occurrence into the classified report list.
-func (c *context) recordParamRef(name string, kind linker.ParamKind, owner linker.ParamOwner) {
+func (c *context) recordParamRef(name string, kind linker.ParamKind, owner linker.ParamOwner, endpoints ...string) {
 	if name == "" {
 		return
 	}
-	key := fmt.Sprintf("%s|%d|%d", name, kind, owner)
-	if i, seen := c.paramCount[key]; seen {
+	// One name yields one report line. The same name can be seen several times
+	// for a script (unattributed first, then attributed once its builder is
+	// bound to a request), so the strongest owner wins and the counts add up.
+	for i := range c.paramRefs {
+		if c.paramRefs[i].Name != name || c.paramRefs[i].Kind != kind {
+			continue
+		}
+		_ = i
 		c.paramRefs[i].Count++
+		if owner > c.paramRefs[i].Owner {
+			c.paramRefs[i].Owner = owner
+		}
+		for _, ep := range endpoints {
+			if !containsString(c.paramRefs[i].Endpoints, ep) {
+				c.paramRefs[i].Endpoints = append(c.paramRefs[i].Endpoints, ep)
+			}
+		}
 		return
 	}
-	c.paramCount[key] = len(c.paramRefs)
-	c.paramRefs = append(c.paramRefs, linker.ParamRef{Name: name, Kind: kind, Owner: owner, Count: 1})
+	c.paramRefs = append(c.paramRefs, linker.ParamRef{Name: name, Kind: kind, Owner: owner, Count: 1, Endpoints: append([]string(nil), endpoints...)})
+}
+
+func containsString(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // bindBuilderToRequest records that a builder variable feeds an endpoint, and
 // attaches the names written into it as inferred query parameters.
+// pendingBinding is a request whose parameters were attributed before its
+// address could be resolved.
+type pendingBinding struct {
+	scope     string
+	urlExpr   expr
+	method    string
+	headers   []contract.NameValue
+	body      string
+	source    string
+	inferredM bool
+}
+
+// bindRequestScopes attributes everything a request carries, and remembers the
+// call so the binding can be completed if the address shows up later.
+func (c *context) bindRequestScopes(args []expr, endpoint string, urlExpr expr) {
+	c.bindRequestScopesFull(args, endpoint, urlExpr, "", nil, "", "", false)
+}
+
+func (c *context) bindRequestScopesFull(args []expr, endpoint string, urlExpr expr, method string, headers []contract.NameValue, body, source string, inferred bool) {
+	carrier := c.requestCarrier(endpoint, urlExpr)
+	for _, a := range args {
+		if b := c.builderInExpr(a); b != "" {
+			c.bindBuilderToRequest(b, endpoint)
+		}
+	}
+	for _, sc := range c.scopesInArgs(args) {
+		c.bindScopeToRequest(sc, endpoint, carrier)
+		if endpoint == "" && urlExpr != nil {
+			c.pending = append(c.pending, pendingBinding{
+				scope: sc, urlExpr: urlExpr, method: method,
+				headers: headers, body: body, source: source, inferredM: inferred,
+			})
+		}
+	}
+}
+
+// resolvePending completes the bindings that waited for an address to appear
+// later in the file.
+func (c *context) resolvePending() {
+	for _, p := range c.pending {
+		url := c.resolveURLArg(p.urlExpr)
+		if url == "" {
+			continue
+		}
+		url = trimURLJoin(url)
+		// The request itself was missed when the address was unknown, so it is
+		// emitted now; otherwise the parameters would have nowhere to land.
+		if url != "" && !isLikelyNotAPI(url) {
+			source := p.source
+			if source == "" {
+				source = "js-api"
+			}
+			method := p.method
+			if method == "" {
+				method = "GET"
+			}
+			c.addLink(url, "js-api", source, method)
+			if p.inferredM {
+				c.addObsInferred(url, method, p.headers, p.body, true)
+			} else {
+				c.addObs(url, method, p.headers, p.body)
+			}
+		}
+		c.bindScopeToRequest(p.scope, resolveEndpoint(url, c.sourceURL), "")
+	}
+	c.pending = nil
+}
+
+// collectDeclarations makes one pass over a file recording only the facts a
+// request needs to be understood: which method owns which builder, which
+// variable received which method's result, and what addresses properties were
+// given. It runs before the request walk because real code defines things
+// after using them - a component assigns app.ajaxUrl below the method that
+// fetches through it - and a single pass would meet the request first and never
+// learn where it goes. Nothing here records an endpoint, so running it ahead
+// of the real analysis costs no accuracy.
+func (c *context) collectDeclarations(stmts []stmt) {
+	for _, s := range stmts {
+		c.collectStmt(s)
+	}
+}
+
+func (c *context) collectStmt(s stmt) {
+	switch s := s.(type) {
+	case *varDecl:
+		if ne, ok := s.init.(*newExpr); ok {
+			if id, ok := ne.callee.(*identExpr); ok {
+				switch id.name {
+				case "FormData", "URLSearchParams":
+					kind := linker.ParamQuery
+					if id.name == "FormData" {
+						kind = linker.ParamForm
+					}
+					c.builderKind[s.name] = kind
+					if _, known := c.formData[s.name]; !known {
+						c.formData[s.name] = map[string]string{}
+					}
+					if fn := c.currentFunc(); fn != "" {
+						c.builderScope[s.name] = fn
+						c.scopeKind[fn] = kind
+					}
+				}
+			}
+		}
+		// A variable that received a method's result stands in for whatever
+		// that method builds.
+		if call, ok := s.init.(*callExpr); ok {
+			switch callee := call.callee.(type) {
+			case *memberExpr:
+				c.varScope[s.name] = callee.property
+			case *identExpr:
+				c.varScope[s.name] = callee.name
+			}
+		}
+		c.collectExpr(s.init)
+	case *exprStmt:
+		c.collectExpr(s.expr)
+	case *blockStmt:
+		c.collectDeclarations(s.stmts)
+	case *ifStmt:
+		c.collectExpr(s.condition)
+		c.collectStmt(s.consequent)
+		c.collectStmt(s.alternate)
+	case *forStmt:
+		c.collectStmt(s.init)
+		c.collectStmt(s.body)
+	case *whileStmt:
+		c.collectExpr(s.condition)
+		c.collectStmt(s.body)
+	case *returnStmt:
+		c.collectExpr(s.expr)
+	case *tryStmt:
+		for _, b := range []*blockStmt{s.body, s.catch, s.finally} {
+			if b != nil {
+				c.collectDeclarations(b.stmts)
+			}
+		}
+	case *funcDecl:
+		c.collectBody(s.name, s.body)
+	case *classExpr:
+		for _, p := range s.props {
+			c.collectExpr(p.value)
+		}
+	}
+}
+
+// collectBody collects a body under a method name, so builders declared inside
+// it belong to that method.
+func (c *context) collectBody(name string, body *blockStmt) {
+	if body == nil {
+		return
+	}
+	c.funcStack = append(c.funcStack, name)
+	c.collectDeclarations(body.stmts)
+	c.funcStack = c.funcStack[:len(c.funcStack)-1]
+}
+
+func (c *context) collectExpr(e expr) {
+	switch e := e.(type) {
+	case nil:
+	case *objectExpr:
+		for _, p := range e.properties {
+			if fe, ok := p.value.(*funcExpr); ok {
+				c.collectBody(p.key, fe.body)
+				continue
+			}
+			c.collectExpr(p.value)
+		}
+	case *funcExpr:
+		c.collectBody("", e.body)
+	case *classExpr:
+		for _, p := range e.props {
+			c.collectExpr(p.value)
+		}
+	case *newExpr:
+		if id, ok := e.callee.(*identExpr); ok {
+			// A builder constructor tells the pass that a query builder is
+			// being made here; the variable name is recorded by the token
+			// pass, which sees the assignment.
+			_ = id
+		}
+	case *callExpr:
+		// "p.append('sort', ...)" inside a method: the name belongs to that
+		// method. The token pass cannot tell two methods apart when they both
+		// use a variable called p, and on a real site they do - one builds the
+		// API query, the other the shareable page URL.
+		if me, ok := e.callee.(*memberExpr); ok {
+			switch me.property {
+			case "set", "append", "delete":
+				if id, ok := me.object.(*identExpr); ok {
+					if _, tracked := c.builderKind[id.name]; tracked && len(e.args) > 0 {
+						c.noteScopeField(c.currentFunc(), c.evalExpr(e.args[0]))
+					}
+				}
+			}
+		}
+		c.collectExpr(e.callee)
+		for _, a := range e.args {
+			c.collectExpr(a)
+		}
+	case *binaryExpr:
+		if e.op == "=" {
+			if me, ok := e.left.(*memberExpr); ok {
+				if val := c.evalExpr(e.right); val != "" {
+					c.props[exprPath(me)] = map[string]string{"": val}
+				}
+			}
+		}
+		c.collectExpr(e.left)
+		c.collectExpr(e.right)
+	case *seqExpr:
+		for _, ex := range e.exprs {
+			c.collectExpr(ex)
+		}
+	}
+}
+
+// analyzeObjectMethods walks the methods of an object literal, descending into
+// nested literals. Frameworks nest them ("methods: { load() {...} }"), and a
+// request two levels down is still a request.
+func (c *context) analyzeObjectMethods(oe *objectExpr) {
+	for _, p := range oe.properties {
+		switch v := p.value.(type) {
+		case *funcExpr:
+			c.funcStack = append(c.funcStack, p.key)
+			if v.body != nil {
+				c.analyze(v.body.stmts)
+			}
+			c.funcStack = c.funcStack[:len(c.funcStack)-1]
+		case *objectExpr:
+			c.analyzeObjectMethods(v)
+		}
+	}
+}
+
+// analyzeClass walks a class body. Every method is its own scope, so a builder
+// declared in one can be tied to the request that consumes it in another.
+func (c *context) analyzeClass(e *classExpr) {
+	for _, p := range e.props {
+		fe, ok := p.value.(*funcExpr)
+		if !ok {
+			c.analyzeExpr(p.value)
+			continue
+		}
+		c.funcStack = append(c.funcStack, p.key)
+		if fe.body != nil {
+			c.analyze(fe.body.stmts)
+		}
+		c.funcStack = c.funcStack[:len(c.funcStack)-1]
+	}
+}
+
+// linkScopeFields adds the token pass's fields to any method whose own body
+// did not contribute them. The declaration pass records fields per method
+// directly, which is the accurate source; this only fills the gap for builders
+// whose calls the parser never reached.
+func (c *context) linkScopeFields() {
+	for builder, fn := range c.builderScope {
+		if fn == "" {
+			continue
+		}
+		for name := range c.formData[builder] {
+			c.noteScopeField(fn, name)
+		}
+	}
+}
+
+// endpointPropNames are the property names that conventionally hold a request
+// address. Only these are looked up by name: a minified one-off name is never
+// resolved this way, so the shortcut cannot invent an endpoint.
+var endpointPropNames = []string{"url", "uri", "endpoint", "api", "path", "ajax", "host", "base"}
+
+// uniqueEndpointProp resolves "this.ajaxUrl" from an object literal declared
+// elsewhere in the same script, but only when the name carries a single value.
+// Two objects with different values for it means the name is ambiguous, and an
+// ambiguous name resolves to nothing rather than to a guess.
+func (c *context) uniqueEndpointProp(key string) (string, bool) {
+	lower := strings.ToLower(key)
+	conventional := false
+	for _, part := range endpointPropNames {
+		if strings.Contains(lower, part) {
+			conventional = true
+			break
+		}
+	}
+	if !conventional {
+		return "", false
+	}
+	found := ""
+	consider := func(v string) bool {
+		v = strings.TrimSpace(v)
+		if v == "" || !looksLikeURL(v) {
+			return true
+		}
+		if found != "" && found != v {
+			found = ""
+			return false
+		}
+		found = v
+		return true
+	}
+	consistent := true
+	for path, props := range c.props {
+		if !consistent {
+			break
+		}
+		// Declared as a field of an object literal ("{ajaxUrl: '/api/x'}") and
+		// used through a receiver ("this.ajaxUrl"), the same value is reached
+		// under different keys, so both spellings are consulted.
+		if !consider(props[key]) {
+			consistent = false
+		}
+		if i := strings.LastIndex(path, "."); i >= 0 && path[i+1:] == key {
+			if !consider(props[""]) {
+				consistent = false
+			}
+		}
+	}
+	if !consistent {
+		return "", false
+	}
+	return found, found != ""
+}
+
+// isFetchLike reports the transport-level callers, where the first argument is
+// the address by construction. Client methods (api.get, axios.post) are
+// classified elsewhere and do not need this.
+func isFetchLike(callee expr) bool {
+	path := exprPath(callee)
+	if i := strings.LastIndex(path, "."); i >= 0 {
+		path = path[i+1:]
+	}
+	switch path {
+	case "fetch", "ajax", "open", "send":
+		return true
+	}
+	return false
+}
+
+// currentFunc is the method or function the analyzer is inside, or "" at
+// top level.
+func (c *context) currentFunc() string {
+	if len(c.funcStack) == 0 {
+		return ""
+	}
+	return c.funcStack[len(c.funcStack)-1]
+}
+
+// noteScopeField records that a method builds a parameter, so the names it
+// contributes can be attributed when the method is called from a request.
+func (c *context) noteScopeField(fn, name string) {
+	if fn == "" || name == "" {
+		return
+	}
+	for _, existing := range c.scopeFields[fn] {
+		if existing == name {
+			return
+		}
+	}
+	c.scopeFields[fn] = append(c.scopeFields[fn], name)
+}
+
+// scopesInArgs collects the method names whose builders feed a request,
+// wherever they sit in its arguments.
+func (c *context) scopesInArgs(args []expr) []string {
+	var out []string
+	for _, a := range args {
+		for _, sc := range c.scopesInExpr(a) {
+			already := false
+			for _, existing := range out {
+				if existing == sc {
+					already = true
+					break
+				}
+			}
+			if !already {
+				out = append(out, sc)
+			}
+		}
+	}
+	return out
+}
+
+// requestCarrier names the URL expression a request travels through when the
+// code does not spell the endpoint out. "this.ajaxUrl" is the truth here: the
+// request exists, its literal address is set elsewhere.
+func (c *context) requestCarrier(resolved string, arg expr) string {
+	if resolved != "" {
+		return ""
+	}
+	return exprLabel(arg)
+}
+
+// exprLabel renders the readable shape of an expression, preferring the part
+// that names the resource.
+func exprLabel(e expr) string {
+	switch n := e.(type) {
+	case nil:
+		return ""
+	case *stringExpr:
+		return n.value
+	case *identExpr:
+		return n.name
+	case *memberExpr:
+		if base := exprLabel(n.object); base != "" {
+			return base + "." + n.property
+		}
+		return n.property
+	case *callExpr:
+		if me, ok := n.callee.(*memberExpr); ok {
+			return exprLabel(me) + "(...)"
+		}
+		return exprLabel(n.callee) + "(...)"
+	case *binaryExpr:
+		if n.op == "+" {
+			if l := exprLabel(n.left); l != "" {
+				return l
+			}
+			return exprLabel(n.right)
+		}
+	case *templateExpr:
+		for _, part := range n.parts {
+			if l := exprLabel(part); l != "" {
+				return l
+			}
+		}
+	case *objectExpr:
+		return "{...}"
+	}
+	return ""
+}
+
+// scopesInExpr collects method names whose builders flow into an expression:
+// a direct call (this.buildParams(1)) or a variable that received its result.
+func (c *context) scopesInExpr(e expr) []string {
+	var out []string
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		for _, existing := range out {
+			if existing == name {
+				return
+			}
+		}
+		// The name is kept even when no builder is known for it yet: the
+		// fields are joined onto the method after the walk, so filtering here
+		// would depend on whether the method was read before its call site.
+		out = append(out, name)
+	}
+	var walk func(expr)
+	walk = func(e expr) {
+		switch n := e.(type) {
+		case nil:
+		case *identExpr:
+			add(c.varScope[n.name])
+		case *memberExpr:
+			if id, ok := n.object.(*identExpr); ok {
+				add(c.varScope[id.name])
+			}
+			walk(n.object)
+		case *callExpr:
+			if me, ok := n.callee.(*memberExpr); ok {
+				add(me.property)
+			} else if id, ok := n.callee.(*identExpr); ok {
+				add(id.name)
+			}
+			walk(n.callee)
+			for _, a := range n.args {
+				walk(a)
+			}
+		case *objectExpr:
+			for _, p := range n.properties {
+				walk(p.value)
+			}
+		case *binaryExpr:
+			walk(n.left)
+			walk(n.right)
+		case *templateExpr:
+			for _, part := range n.parts {
+				walk(part)
+			}
+		}
+	}
+	walk(e)
+	return out
+}
+
 func (c *context) bindBuilderToRequest(builder, endpoint string) {
 	fields := c.formData[builder]
 	if len(fields) == 0 {
+		return
+	}
+	if endpoint == "" {
 		return
 	}
 	if c.boundBuilders == nil {
@@ -287,8 +809,30 @@ func (c *context) bindBuilderToRequest(builder, endpoint string) {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	kind := c.builderKind[builder]
-	if kind != linker.ParamForm {
+	if fn := c.builderScope[builder]; fn != "" {
+		for _, n := range names {
+			c.noteScopeField(fn, n)
+		}
+	}
+	c.bindFieldsToRequest(builder, names, c.builderKind[builder], endpoint, "")
+}
+
+// bindScopeToRequest attributes the parameters a method builds to the request
+// consuming that method's result. The endpoint is empty when the code keeps
+// the address in a property: the carrier then names the expression the query
+// travels through, which is all that can be said without inventing a URL.
+func (c *context) bindScopeToRequest(scope, endpoint, carrier string) {
+	names := c.scopeFields[scope]
+	if len(names) == 0 {
+		return
+	}
+	sorted := append([]string(nil), names...)
+	sort.Strings(sorted)
+	c.bindFieldsToRequest("scope:"+scope, sorted, c.scopeKind[scope], endpoint, carrier)
+}
+
+func (c *context) bindFieldsToRequest(builder string, names []string, kind linker.ParamKind, endpoint, carrier string) {
+	if kind != linker.ParamForm && endpoint != "" {
 		// A URLSearchParams builder contributes query parameters.
 		for _, n := range names {
 			c.paramBound[endpoint] = append(c.paramBound[endpoint], contract.NameValue{Name: n})
@@ -301,10 +845,66 @@ func (c *context) bindBuilderToRequest(builder, endpoint string) {
 		contributed[n] = true
 	}
 	for i := range c.paramRefs {
-		if contributed[c.paramRefs[i].Name] && c.paramRefs[i].Owner == linker.OwnerUnknown {
+		if !contributed[c.paramRefs[i].Name] {
+			continue
+		}
+		if c.paramRefs[i].Owner == linker.OwnerUnknown {
 			c.paramRefs[i].Owner = linker.OwnerRequest
 		}
+		if endpoint != "" {
+			if !containsString(c.paramRefs[i].Endpoints, endpoint) {
+				c.paramRefs[i].Endpoints = append(c.paramRefs[i].Endpoints, endpoint)
+			}
+			// The address is known now, so the fallback carrier is obsolete.
+			c.paramRefs[i].Carrier = ""
+		}
+		if carrier != "" && c.paramRefs[i].Carrier == "" {
+			c.paramRefs[i].Carrier = carrier
+		}
 	}
+}
+
+// builderInExpr reports a tracked builder variable anywhere inside an
+// expression: builders are passed directly, inside an init object
+// ({body: sp}), or folded into the URL expression (base + '?' + p).
+func (c *context) builderInExpr(e expr) string {
+	switch n := e.(type) {
+	case nil:
+		return ""
+	case *identExpr:
+		if _, tracked := c.builderKind[n.name]; tracked {
+			return n.name
+		}
+	case *objectExpr:
+		for _, p := range n.properties {
+			if b := c.builderInExpr(p.value); b != "" {
+				return b
+			}
+		}
+	case *binaryExpr:
+		if b := c.builderInExpr(n.left); b != "" {
+			return b
+		}
+		return c.builderInExpr(n.right)
+	case *callExpr:
+		if b := c.builderInExpr(n.callee); b != "" {
+			return b
+		}
+		for _, a := range n.args {
+			if b := c.builderInExpr(a); b != "" {
+				return b
+			}
+		}
+	case *newExpr:
+		for _, a := range n.args {
+			if b := c.builderInExpr(a); b != "" {
+				return b
+			}
+		}
+	case *memberExpr:
+		return c.builderInExpr(n.object)
+	}
+	return ""
 }
 
 // bindBuilderParams links the names written into a builder to the endpoints
@@ -1035,6 +1635,20 @@ type context struct {
 	builderFromLocation map[string]bool
 	// paramRefs collects the classified parameter names for the report.
 	paramRefs []linker.ParamRef
+	// funcStack, scopeFields, scopeKind and varScope model method boundaries:
+	// a builder declared inside buildParams() belongs to buildParams(), and a
+	// call to it hands those names to whichever request consumes the result.
+	// Without this, every such name stayed unattributed.
+	funcStack    []string
+	scopeFields  map[string][]string
+	scopeKind    map[string]linker.ParamKind
+	builderScope map[string]string
+	varScope     map[string]string
+	// pending holds request bindings whose address was not known yet. Real
+	// code assigns the endpoint after the method that uses it
+	// ("app.ajaxUrl = '/api/...'" below the component), so these are retried
+	// once the whole file has been read.
+	pending []pendingBinding
 	// paramCount maps a name/kind/owner key to its index in paramRefs and
 	// folds repeated occurrences of the same name into one record.
 	paramCount map[string]int
@@ -1088,6 +1702,10 @@ func newContext(sourceURL string, fullInfo bool) *context {
 		sourceURL:           sourceURL,
 		fullInfo:            fullInfo,
 		vars:                map[string]string{},
+		scopeFields:         map[string][]string{},
+		scopeKind:           map[string]linker.ParamKind{},
+		builderScope:        map[string]string{},
+		varScope:            map[string]string{},
 		props:               map[string]map[string]string{},
 		varInits:            map[string]expr{},
 		seen:                map[string]bool{},
@@ -1102,7 +1720,6 @@ func newContext(sourceURL string, fullInfo bool) *context {
 		clientInst:          map[string]initConfig{},
 		builderKind:         map[string]linker.ParamKind{},
 		builderFromLocation: map[string]bool{},
-		paramCount:          map[string]int{},
 		paramBound:          map[string][]contract.NameValue{},
 	}
 }
@@ -1577,11 +2194,26 @@ func (c *context) analyzeStmt(s stmt) {
 		if s.body != nil {
 			c.analyzeStmt(s.body)
 		}
+	case *tryStmt:
+		for _, b := range []*blockStmt{s.body, s.catch, s.finally} {
+			if b != nil {
+				c.analyze(b.stmts)
+			}
+		}
+	case *classExpr:
+		c.analyzeClass(s)
 	case *funcDecl:
+		c.funcStack = append(c.funcStack, s.name)
 		if s.body != nil {
 			c.analyze(s.body.stmts)
 		}
+		c.funcStack = c.funcStack[:len(c.funcStack)-1]
 	case *returnStmt:
+		// "return fetch(...)" is how a request is written as often as a bare
+		// call; skipping the expression loses the endpoint.
+		if s.expr != nil {
+			c.analyzeExpr(s.expr)
+		}
 	case *breakStmt:
 	case *continueStmt:
 	}
@@ -1591,6 +2223,17 @@ func (c *context) analyzeVarDecl(d *varDecl) {
 	val := c.evalExpr(d.init)
 	if val != "" {
 		c.vars[d.name] = val
+	}
+	// A variable that receives a method's result stands in for whatever that
+	// method builds, so the request consuming the variable can be linked back
+	// to the method.
+	if call, ok := d.init.(*callExpr); ok {
+		switch callee := call.callee.(type) {
+		case *memberExpr:
+			c.varScope[d.name] = callee.property
+		case *identExpr:
+			c.varScope[d.name] = callee.name
+		}
 	}
 	switch d.init.(type) {
 	case *objectExpr, *arrayExpr, *callExpr:
@@ -1619,7 +2262,12 @@ func (c *context) analyzeVarDecl(d *varDecl) {
 		}
 	}
 	if fe, ok := d.init.(*funcExpr); ok && fe.body != nil {
+		c.funcStack = append(c.funcStack, d.name)
 		c.analyze(fe.body.stmts)
+		c.funcStack = c.funcStack[:len(c.funcStack)-1]
+	}
+	if oe, ok := d.init.(*objectExpr); ok {
+		c.analyzeObjectMethods(oe)
 	}
 	// var x = new XMLHttpRequest(): start tracking the instance so its
 	// open()/setRequestHeader()/send() calls fold into one AJAX contract.
@@ -1638,12 +2286,30 @@ func (c *context) analyzeVarDecl(d *varDecl) {
 					cfg.method = stringOr(cfg.method, "GET")
 					c.reqVar[d.name] = cfg
 				}
+			case "":
+				// A variable that receives a method's result stands in for the
+				// builder that method fills.
+				if call, ok := d.init.(*callExpr); ok {
+					if me, ok := call.callee.(*memberExpr); ok {
+						c.varScope[d.name] = me.property
+					} else if id, ok := call.callee.(*identExpr); ok {
+						c.varScope[d.name] = id.name
+					}
+				}
 			case "FormData", "URLSearchParams":
-				c.formData[d.name] = map[string]string{}
+				// Keep fields the token pass already collected for this
+				// builder: re-declaring it must not drop them.
+				if _, known := c.formData[d.name]; !known {
+					c.formData[d.name] = map[string]string{}
+				}
 				if id.name == "FormData" {
 					c.builderKind[d.name] = linker.ParamForm
 				} else {
 					c.builderKind[d.name] = linker.ParamQuery
+				}
+				if fn := c.currentFunc(); fn != "" {
+					c.builderScope[d.name] = fn
+					c.scopeKind[fn] = c.builderKind[d.name]
 				}
 			case "Headers":
 				c.headersVar[d.name] = true
@@ -1656,6 +2322,15 @@ func (c *context) analyzeVarDecl(d *varDecl) {
 	if ce, ok := d.init.(*callExpr); ok {
 		if me, ok := ce.callee.(*memberExpr); ok && me.property == "create" && len(ce.args) > 0 {
 			c.clientInst[d.name] = c.parseInit(ce.args[0])
+		}
+	}
+	// "var resp = await fetch(...)" is how async request code is written, and
+	// the request lives in the initializer. Without this the whole statement
+	// was inert here and only the token pass could still see it.
+	if _, isNew := d.init.(*newExpr); !isNew {
+		switch d.init.(type) {
+		case *callExpr, *binaryExpr, *memberExpr:
+			c.analyzeExpr(d.init)
 		}
 	}
 }
@@ -1759,8 +2434,11 @@ func (c *context) analyzeExpr(e expr) {
 		if match != callNone {
 			c.applyMatch(match, e.args, objName, methodName, httpMethod)
 		}
+	case *classExpr:
+		c.analyzeClass(e)
 	case *objectExpr:
 		c.analyzeConfigObj(e)
+		c.analyzeObjectMethods(e)
 	case *binaryExpr:
 		if e.op == "=" {
 			if id, ok := e.left.(*identExpr); ok {
@@ -1805,22 +2483,22 @@ func (c *context) analyzeExpr(e expr) {
 					if tracked, exists := c.props[rightPath]; exists {
 						c.props[path] = tracked
 					}
-					val := c.evalExpr(e.right)
-					if val != "" {
-						c.props[path] = map[string]string{"": val}
-					}
-					// also store as simple property value
-					objPath := exprPath(me.object)
-					if tracked, ok := c.props[objPath]; ok {
-						if v, ok := tracked[me.property]; ok {
-							c.vars[me.property] = v
-						}
-					}
 				}
+				// this.ajaxUrl = "/api/search": the commonest way a class
+				// spells out where it talks to. Without this the endpoint
+				// stays a bare property reference and every parameter built
+				// around it loses its address.
 				val := c.evalExpr(e.right)
 				if val != "" {
+					c.props[path] = map[string]string{"": val}
 					if id, ok := me.object.(*identExpr); ok {
 						c.vars[id.name+"."+me.property] = val
+					}
+				}
+				objPath := exprPath(me.object)
+				if tracked, ok := c.props[objPath]; ok {
+					if v, ok := tracked[me.property]; ok {
+						c.vars[me.property] = v
 					}
 				}
 			}
@@ -1833,9 +2511,11 @@ func (c *context) analyzeExpr(e expr) {
 			c.analyzeExpr(ex)
 		}
 	case *funcExpr:
+		c.funcStack = append(c.funcStack, "")
 		if e.body != nil {
 			c.analyze(e.body.stmts)
 		}
+		c.funcStack = c.funcStack[:len(c.funcStack)-1]
 	}
 }
 
@@ -1960,6 +2640,17 @@ var chainMethods = map[string]bool{
 
 func (c *context) analyzeCall(ce *callExpr) {
 	if me, ok := ce.callee.(*memberExpr); ok {
+		// A name written into a builder belongs to the method that declares
+		// the builder, which is what makes it attributable when the request
+		// using it lives somewhere else.
+		if id, isIdent := me.object.(*identExpr); isIdent {
+			switch me.property {
+			case "set", "append", "delete":
+				if _, tracked := c.builderKind[id.name]; tracked && len(ce.args) > 0 {
+					c.noteBuilderField(id.name, c.evalExpr(ce.args[0]))
+				}
+			}
+		}
 		// Raw XHR lifecycle: correlate setRequestHeader/send with the open()
 		// recorded for the same object. Handled before the chain-method
 		// shortcut below, which would otherwise swallow send().
@@ -2022,6 +2713,26 @@ func (c *context) analyzeCall(ce *callExpr) {
 
 	match, objName, methodName, httpMethod := c.resolveCall(ce)
 	if match == callNone {
+		// Not a request, but its arguments may hold one: component
+		// factories (createApp, defineComponent, Vue.component) wrap whole
+		// components - methods included - in an object argument. Not walking
+		// it loses every request the component makes.
+		for _, a := range ce.args {
+			c.analyzeExpr(a)
+		}
+		// A request whose address is kept in a property
+		// ("fetch(this.ajaxUrl + '?' + p)") is still a request, and the
+		// parameters travelling through it can still be attributed - to the
+		// expression rather than to a URL. The names would otherwise be
+		// reported with no owner at all.
+		if len(ce.args) > 0 && isFetchLike(ce.callee) && c.resolveURLArg(ce.args[0]) == "" {
+			if scopes := c.scopesInArgs(ce.args); len(scopes) > 0 {
+				carrier := exprLabel(ce.args[0])
+				for _, sc := range scopes {
+					c.bindScopeToRequest(sc, "", carrier)
+				}
+			}
+		}
 		return
 	}
 	c.applyMatch(match, ce.args, objName, methodName, httpMethod)
@@ -3097,9 +3808,26 @@ func (c *context) placeholder(e expr) string {
 // so opaque bases like this.ajaxUrl never surface as junk links.
 func (c *context) resolveURLArg(e expr) string {
 	if s := c.evalExpr(e); s != "" {
-		return s
+		return trimURLJoin(s)
 	}
 	switch e := e.(type) {
+	case *memberExpr:
+		// this.ajaxUrl and friends: property assignments are already recorded
+		// in props, which is what lets an endpoint assembled from a member
+		// expression resolve to a literal path.
+		if props, ok := c.props[exprPath(e)]; ok {
+			if v := strings.TrimSpace(props[""]); v != "" {
+				return v
+			}
+		}
+		if props, ok := c.props[e.property]; ok {
+			if v := strings.TrimSpace(props[""]); v != "" {
+				return v
+			}
+		}
+		if v, ok := c.uniqueEndpointProp(e.property); ok {
+			return v
+		}
 	case *templateExpr:
 		var b strings.Builder
 		for _, p := range e.parts {
@@ -3118,16 +3846,16 @@ func (c *context) resolveURLArg(e expr) string {
 		return b.String()
 	case *binaryExpr:
 		if e.op == "+" {
-			left := c.evalExpr(e.left)
+			left := c.resolveURLArg(e.left)
 			if left != "" {
-				right := c.evalExpr(e.right)
+				right := c.resolveURLArg(e.right)
 				if right != "" {
 					return left + right
 				}
 				// static prefix + dynamic tail: keep the prefix
 				return left
 			}
-			right := c.evalExpr(e.right)
+			right := c.resolveURLArg(e.right)
 			if right != "" {
 				if strings.HasPrefix(right, "/") {
 					if ph := c.placeholder(e.left); ph != "" {
@@ -3138,6 +3866,15 @@ func (c *context) resolveURLArg(e expr) string {
 		}
 	}
 	return ""
+}
+
+// trimURLJoin drops separators left behind when a query string is appended as
+// "endpoint" + "?" + params: the tail is unresolved, but the path is not.
+func trimURLJoin(s string) string {
+	for strings.HasSuffix(s, "?") || strings.HasSuffix(s, "&") {
+		s = strings.TrimRight(s, "?&")
+	}
+	return s
 }
 
 func (c *context) evalCall(e *callExpr) string {
@@ -3653,16 +4390,7 @@ func (p *parser) parseStmt() stmt {
 			return p.parseExprStmt()
 		case "import", "export", "class":
 			if t.value == "class" {
-				p.advance()
-				for p.peek().typ != tokPunct || p.peek().value != "{" {
-					if p.peek().typ == tokEOF {
-						return nil
-					}
-					p.advance()
-				}
-				p.skipBlock()
-				p.skipSemicolons()
-				return nil
+				return p.parseClassExpr()
 			}
 			if t.value == "import" {
 				p.advance()
@@ -3882,18 +4610,35 @@ func (p *parser) parseSwitchStmt() stmt {
 	return nil
 }
 
+// parseTryStmt keeps the bodies. Requests are wrapped in try/catch as a
+// matter of course, and skipping the block threw the request away with it.
 func (p *parser) parseTryStmt() stmt {
-	p.advance()
-	p.skipBlock()
+	p.advance() // try
+	ts := &tryStmt{body: p.parseBlockStmt()}
 	if p.peek().typ == tokKeyword && p.peek().value == "catch" {
 		p.advance()
-		p.skipBlock()
+		if p.peek().typ == tokPunct && p.peek().value == "(" {
+			depth := 0
+			for p.peek().typ != tokEOF {
+				v := p.peek().value
+				p.advance()
+				if v == "(" {
+					depth++
+				} else if v == ")" {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+			}
+		}
+		ts.catch = p.parseBlockStmt()
 	}
 	if p.peek().typ == tokKeyword && p.peek().value == "finally" {
 		p.advance()
-		p.skipBlock()
+		ts.finally = p.parseBlockStmt()
 	}
-	return nil
+	return ts
 }
 
 func (p *parser) parseBlockStmt() *blockStmt {
@@ -4080,6 +4825,11 @@ func (p *parser) parseExpr(minPrec int) expr {
 			p.advance()
 			expr := p.parseExpr(precUnary)
 			left = &unaryExpr{op: t.value, expr: expr}
+		case "await", "yield":
+			// "var r = await fetch(url)" is how async request code is usually
+			// written. Dropping await dropped the request with it.
+			p.advance()
+			left = p.parseExpr(precUnary)
 		default:
 			p.advance()
 			left = &identExpr{name: t.value}
@@ -4146,13 +4896,21 @@ func (p *parser) parseExpr(minPrec int) expr {
 						key = p.peek().value
 						p.advance()
 					case tokKeyword:
-						if p.peek().value == "async" {
-							key = "async"
+						// "async load() {...}" and "get value() {...}": the
+						// modifier is not the key, and treating it as one
+						// silently loses the whole method - which is where
+						// async request code lives.
+						switch p.peek().value {
+						case "async", "get", "set", "static", "asyncget", "asyncset":
 							p.advance()
-						} else if p.peek().value == "get" || p.peek().value == "set" {
-							key = p.peek().value
-							p.advance()
-						} else {
+							switch p.peek().typ {
+							case tokString, tokIdent, tokNumber, tokKeyword:
+								key = p.peek().value
+								p.advance()
+							default:
+								continue
+							}
+						default:
 							p.advance()
 							continue
 						}
@@ -4434,6 +5192,132 @@ func (p *parser) parseNewCallee() expr {
 	return left
 }
 
+// parseClassExpr parses a class body into its methods and fields. Classes are
+// where modern sites keep request code - components, services, controllers -
+// so skipping the body loses every endpoint, builder and response schema
+// inside it. Anything unrecognised is stepped over rather than abandoned: a
+// partial class is still worth far more than none.
+func (p *parser) parseClassExpr() stmt {
+	p.advance() // class
+	name := ""
+	if p.peek().typ == tokIdent {
+		name = p.peek().value
+		p.advance()
+	}
+	// extends Base / mixin(Base): everything up to the body is not interesting.
+	for p.peek().typ != tokPunct || p.peek().value != "{" {
+		if p.peek().typ == tokEOF {
+			return nil
+		}
+		p.advance()
+	}
+	return p.parseClassBody(name)
+}
+
+func (p *parser) parseClassBody(name string) *classExpr {
+	if p.peek().typ != tokPunct || p.peek().value != "{" {
+		return nil
+	}
+	p.advance()
+	cls := &classExpr{name: name}
+	guard := 0
+	for p.peek().typ != tokPunct || p.peek().value != "}" {
+		guard++
+		if p.peek().typ == tokEOF || guard > 50000 {
+			p.skipBlock()
+			return cls
+		}
+		// Modifiers: static, async, get, set, generator star, accessor.
+		for {
+			t := p.peek()
+			if t.typ == tokPunct && t.value == "*" {
+				p.advance()
+				continue
+			}
+			if t.typ == tokKeyword && (t.value == "static" || t.value == "async" || t.value == "get" || t.value == "set" || t.value == "accessor") {
+				// "static {" is a static initialization block, not a field.
+				if t.value == "static" {
+					save := p.pos
+					p.advance()
+					if p.peek().typ == tokPunct && p.peek().value == "{" {
+						body := p.parseBlockStmt()
+						cls.props = append(cls.props, property{key: "static", value: &funcExpr{body: body}})
+						continue
+					}
+					p.pos = save
+				}
+				p.advance()
+				continue
+			}
+			break
+		}
+		// Computed key: the name is dynamic, so keep the body and drop the key.
+		if p.peek().typ == tokPunct && p.peek().value == "[" {
+			p.advance()
+			depth := 1
+			for depth > 0 && p.peek().typ != tokEOF {
+				v := p.peek().value
+				p.advance()
+				if v == "[" {
+					depth++
+				} else if v == "]" {
+					depth--
+				}
+			}
+			if p.peek().typ == tokPunct && p.peek().value == "(" {
+				p.parseArgs()
+				body := p.parseBlockStmt()
+				cls.props = append(cls.props, property{key: "", value: &funcExpr{body: body}})
+			} else if p.peek().typ == tokPunct && p.peek().value == "=" {
+				p.advance()
+				p.parseExpr(0)
+				if p.peek().typ == tokPunct && p.peek().value == ";" {
+					p.advance()
+				}
+			}
+			continue
+		}
+		key := ""
+		switch t := p.peek(); {
+		case t.typ == tokPunct && t.value == "#":
+			p.advance()
+			key = "#" + p.peek().value
+			p.advance()
+		case t.typ == tokString, t.typ == tokIdent, t.typ == tokNumber, t.typ == tokKeyword:
+			// "constructor" and friends arrive as keywords; a method is a
+			// method whatever its name was tokenized as.
+			key = t.value
+			p.advance()
+		default:
+			p.advance()
+			continue
+		}
+		switch {
+		case p.peek().typ == tokPunct && p.peek().value == "(":
+			p.parseArgs()
+			body := p.parseBlockStmt()
+			cls.props = append(cls.props, property{key: key, value: &funcExpr{body: body}})
+		case p.peek().typ == tokPunct && p.peek().value == "=":
+			p.advance()
+			cls.props = append(cls.props, property{key: key, value: p.parseExpr(0)})
+			if p.peek().typ == tokPunct && p.peek().value == ";" {
+				p.advance()
+			}
+		case p.peek().typ == tokPunct && p.peek().value == ";":
+			p.advance()
+			cls.props = append(cls.props, property{key: key, value: &identExpr{name: key}})
+		default:
+			// A field with no value, or something unexpected: do not spin.
+			if p.peek().typ == tokPunct && (p.peek().value == "," || p.peek().value == ";") {
+				p.advance()
+			}
+		}
+	}
+	p.advance() // }
+	p.skipSemicolons()
+	return cls
+}
+
 func (p *parser) parseArgs() []expr {
 	p.expect(tokPunct, "(")
 	var args []expr
@@ -4598,6 +5482,16 @@ type arrayExpr struct {
 
 func (*arrayExpr) exprNode() {}
 
+// classExpr holds a parsed class body: its methods and fields are what the
+// analyzer walks, since that is where the requests live.
+type classExpr struct {
+	name  string
+	props []property
+}
+
+func (*classExpr) exprNode() {}
+func (*classExpr) stmtNode() {}
+
 type objectExpr struct {
 	properties []property
 }
@@ -4692,6 +5586,15 @@ type returnStmt struct {
 }
 
 func (*returnStmt) stmtNode() {}
+
+// tryStmt keeps the guarded body: request code lives inside it.
+type tryStmt struct {
+	body    *blockStmt
+	catch   *blockStmt
+	finally *blockStmt
+}
+
+func (*tryStmt) stmtNode() {}
 
 type breakStmt struct{}
 
@@ -4908,9 +5811,6 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 		if len(args) > 0 {
 			url = c.resolveURLArg(args[0])
 		}
-		if url != "" {
-			c.addLink(url, "js-api", objName+"."+methodName, httpMethod)
-		}
 		// fetch(url, init) / new Request(url, init): capture method/body/headers.
 		method := httpMethod
 		var body string
@@ -4922,6 +5822,15 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 			}
 			body, headers = cfg.body, cfg.headers
 		}
+		if len(args) > 0 {
+			// The parameters belong to this request whether or not the code
+			// spells its address out.
+			c.bindRequestScopesFull(args, resolveEndpoint(trimURLJoin(url), c.sourceURL), args[0],
+				method, headers, body, objName+"."+methodName, method == "")
+		}
+		if url != "" {
+			c.addLink(url, "js-api", objName+"."+methodName, httpMethod)
+		}
 		if url != "" {
 			c.addObs(url, method, headers, body)
 		}
@@ -4930,6 +5839,18 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 		var url string
 		if len(args) > 0 {
 			url = c.resolveURLArg(args[0])
+		}
+		if url == "" {
+			// The address is kept in a property ("fetch(this.ajaxUrl + '?' + p)").
+			// The request is still real, and the parameters it carries can
+			// still be attributed - to the expression, not to a URL.
+			if scopes := c.scopesInArgs(args); len(scopes) > 0 {
+				carrier := c.requestCarrier(url, args[0])
+				for _, sc := range scopes {
+					c.bindScopeToRequest(sc, "", carrier)
+					c.pending = append(c.pending, pendingBinding{scope: sc, urlExpr: args[0]})
+				}
+			}
 		}
 		if url != "" {
 			// Resolve a client instance base before judging the shape: "/users"
@@ -5000,6 +5921,13 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 			url = appendQuery(url, params)
 		}
 		if url != "" {
+			target := resolveEndpoint(trimURLJoin(url), c.sourceURL)
+			for _, a := range args {
+				if b := c.builderInExpr(a); b != "" {
+					c.bindBuilderToRequest(b, target)
+				}
+			}
+			c.bindRequestScopes(args, target, args[0])
 			c.addLink(url, "js-api", objName+"."+methodName, m)
 			c.addObs(url, m, headers, body)
 		}
@@ -5068,6 +5996,13 @@ func (c *context) applyGenericCall(args []expr, verb, objName string) {
 	}
 	url := c.resolveURLArg(args[0])
 	if url == "" {
+		if scopes := c.scopesInArgs(args); len(scopes) > 0 {
+			carrier := c.requestCarrier(url, args[0])
+			for _, sc := range scopes {
+				c.bindScopeToRequest(sc, "", carrier)
+				c.pending = append(c.pending, pendingBinding{scope: sc, urlExpr: args[0]})
+			}
+		}
 		return
 	}
 	url = c.applyClientBase(objName, url)
@@ -5106,6 +6041,13 @@ func (c *context) applyGenericCall(args []expr, verb, objName string) {
 	if url == "" || isLikelyNotAPI(url) {
 		return
 	}
+	target := resolveEndpoint(trimURLJoin(url), c.sourceURL)
+	for _, a := range args {
+		if b := c.builderInExpr(a); b != "" {
+			c.bindBuilderToRequest(b, target)
+		}
+	}
+	c.bindRequestScopes(args, target, args[0])
 	c.addLink(url, "js-api", genericMatchSource, method)
 	c.addObsInferred(url, method, headers, cfg.body, inferred)
 }
