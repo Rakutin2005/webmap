@@ -121,6 +121,7 @@ JS for APIs, and show full API details:
 |------|-------------|
 | `-o file.wmse` | Write the whole scan to a static-explorer file, to be read later with `wmse read` |
 | `-o-raw` | Write the file without section compression (larger, but a reader can map a section without inflating it) |
+| `-refs` | Record where each link was found (file, byte offset, line:col, context) into a `.ref` file per source in the file's archive. Requires `-o` |
 
 ## What the report contains
 
@@ -239,6 +240,146 @@ Two flags have no offline meaning of their own, so they became verbs rather than
 new flags: what the file *is* (`wmse info`) and the whole snapshot for other
 tools (`wmse json`). Both take the same flags.
 
+### The `select` session
+
+`wmse select scan.wmse` opens the same data interactively — the report navigated
+by hand, one question at a time. The session stands at a *place*, and a place is
+either a page or a directory, because those are two different questions: a page
+answers "what does this document link to", a directory answers "what is under
+here". The prompt shows both, with the name of the place in brackets:
+
+```
+explore@https://example.com/ [/] > ls
+explore@https://example.com/users [users] > cd /users
+explore@https://example.com/users [users] > ls
+explore@https://example.com/api [api] > ls -d
+```
+
+A **page always wins**: the scan fetched a document at the path, so that page is
+what `ls` describes. A path with no document of its own may still name an index
+that was fetched, and then the index is the page, as a browser would reach it.
+Only a path with neither is a directory, and `ls` there lists every path matching
+it at any depth — whether or not an index exists, which is exactly the case
+`ls -d` is for when a page does answer.
+
+```
+cd [path]        move; a page is preferred over a directory
+ls [path]        the current page's links, or the paths under a directory
+ls -d [path]     ask for a path as a directory, whatever page answers for it
+read [flags]     the scan's whole report, with the reader's flags
+what <path>      what a path is: kind, class, where it was seen
+from <path>      the pages that reference a resource
+api [path]       an endpoint's contract, or why there is none
+find <kind> <g>  search by kind (api, js, css, image, html, any) and glob
+refs [path]      where links were found, from the .ref sidecar
+info             the header of every loaded file
+extend <file>    open another scan and query across both
+history          what has been typed this session
+```
+
+`api` gives one of four *distinct* refusals — not found, not an API, an API with
+no contract in the file, and a contract with no captured request — because those
+are four different facts and each one tells you something. `extend` folds a
+second scan into the session so a question can span both.
+
+**`read` is `wmse read`, run from the prompt.** Same report, same sections, same
+gates, same code — so a file can never be described two ways. And with no flags it
+starts from **the flags the scan itself ran with**, which the file records in its
+metadata: `read` alone shows the report as that scan saw it, with the tree, the
+contracts and the references it asked for. A flag you type is applied on top,
+because a flag you don't pass is one that takes its default — and the default is
+now the scan's own value:
+
+```
+explore@svoydom.kz [/] > read
+  report: the scan's own flags, from the file's metadata
+  === Crawl Tree ===
+  === API Contracts ===
+  === References ===
+```
+
+The report says which of the two it used, because a section nobody asked for is
+otherwise indistinguishable from one the file cannot answer. `wmse read` on the
+command line keeps its own documented defaults — its flags hint exists to describe
+that report.
+
+**The line is edited, not just read.** Tab completes the word under the cursor —
+one candidate whole, several as far as they agree, and the rest written out when
+there is nothing more to insert. Candidates are per command, so `cd` completes
+paths, `find` completes kinds, and `extend` completes files on disk. The arrows
+move along the line and walk the history. Ctrl-A/E/U/K/W, Home, End and Delete
+work as they do in a shell, Escape abandons a line, Ctrl-C abandons it without
+leaving, and Ctrl-D on an empty line leaves.
+
+History is kept for the session and written nowhere. Piped or scripted, the
+session reads whole lines and answers the same things, so nothing a terminal can
+do is something only a terminal can reach.
+
+**Four of the commands go outside the file**, and each says which it is before it
+happens — the difference between reading a document and changing one:
+
+```
+explore@svoydom.kz [/] > source /static/app.js /tmp/app.js
+    from the archive                        no network, the same bytes every time
+explore@svoydom.kz [/] > save /admin/export.csv
+    adding 412 B to scan.wmse               the file grows; the scan's findings do not
+explore@svoydom.kz [/] > req /api/v2/users -H "authorization: Bearer X"
+    curl -H "authorization: Bearer X" http://svoydom.kz/api/v2/users
+explore@svoydom.kz [/] > continue -rdepth 6
+    webmap -r -rdepth 3 -j -apic -url http://svoydom.kz/ -o /tmp/… -rdepth 6
+```
+
+`source` asks the archive first and only fetches what the archive does not hold,
+and it never archives what it fetches — `save` is the command that grows the file.
+`save` is the one command that changes the file you opened, so it says the size
+before writing and the write is atomic. `req` runs curl with your arguments as its
+own argv, so a value with a semicolon in it is one argument and not a command.
+
+`continue` is **not** a resume, and that is worth knowing before you rely on it:
+the scan keeps no frontier of what it has already fetched, so a deeper run
+re-fetches what the last one covered and goes further. The result is a superset —
+nothing is missed — and the requests for the part already seen are the price. It
+inherits the scan's own arguments, replaces only the two that would send the result
+somewhere else (the output file and the scope, the scope being where you are
+standing), and applies what you type last.
+
+**A file can be signed and sealed**, which are properties of the file rather than
+of the session, so they travel with it:
+
+```
+explore@svoydom.kz [/] > sign rsa ~/.wm/sealing.pem
+  signed rsa
+  by rsa sealing.pem
+  key 9f2c1ab4de07f310 (sealing.pem)
+explore@svoydom.kz [/] > save /admin/export.csv
+  this file is signed, and writing it makes the signature invalid
+  signed by rsa sealing.pem on 2026-09-26 16:01 UTC
+  the signature is not re-made, because only the signer can do that
+  write it anyway? [y/N] y
+explore@svoydom.kz [/] > encrypt aes ~/.wm/scan.key
+  encrypting scan.wmse with aes; after this the file on disk cannot be read without it
+  continue? [y/N] y
+```
+
+`sign` covers the file with its own signature section left out, so a file can be
+signed again after a change and cannot be edited without the signature being
+reported broken — on open, and before any write, where it stops and asks. The
+signature is **not** re-made, because only the signer can do that. A session with
+no terminal answers no rather than proceeding: a warning nobody can answer is a
+hang, and not being asked is not consent.
+
+`encrypt` seals the file with AES-256-GCM, under a key from a password
+(PBKDF2, 600 000 rounds), an RSA public key, or a 32-byte key file. It asks first,
+because afterwards the file on disk is ciphertext and the session holds the only
+readable copy. A sealed file reopens with `-i <key-file>`, the reader's one flag of
+its own; a password-encrypted one is asked for instead, without echo, and probed.
+
+A signature says the file has not changed since the holder of that key signed it.
+That is a real property, and it is not "this file is trustworthy" — a file carrying
+its own public key would only be proving that whoever wrote it had a key.
+
+`wmse select -h` lists everything.
+
 **What the file keeps that the report does not show:**
 
 - **The pages actually fetched**, with their depth, content type and link count.
@@ -259,6 +400,28 @@ tools (`wmse json`). Both take the same flags.
   walk it, not just list it.
 - **Which page each link was found on**, which the link table has no column for
   and `wmse json` does.
+- **With `-refs`, where inside that page.** The graph says a link was found on a
+  document; only a reference says *where* — the byte offset, the line and column,
+  and the text around the match. They are stored as a `.ref` file per source in
+  the file's own archive, so a link found in five places keeps all five and you
+  can read the evidence in any editor:
+
+```
+$ ./wmse read scan.wmse -refs
+=== References ===
+  2 reference file(s) in the archive section
+    example.com/index.html.ref
+    example.com/complex/9223/contacts~sort-asc.ref
+
+  in https://example.com/:
+    # source: https://example.com/
+    # type: text/html; charset=utf-8
+    # references: 9
+    120	5:10	...<body> <a href="/complex/9223/contacts?sort=asc">c1</a> <a href="/comp...
+```
+
+  `-refs` without `-o` is an error: there would be nowhere to keep the references,
+  and a flag that silently does nothing is worse than one that explains itself.
 
 **Size.** The format is built to be small, and the two ideas that do most of the
 work are *graph distribution* and *location*:
@@ -345,6 +508,7 @@ sandbox returns synthetic responses.
 ```
 cmd/webmap/          CLI entry point, and the writer for saved scans
 cmd/wmse/            Static explorer: the offline reader for -o files
+internal/archive     tar / tar.gz / zip writer, and the entry-naming rules
 internal/categorizer Link categorization
 internal/color       ANSI colouring helpers
 internal/config      Flags and configuration, shared by the scan and the reader
@@ -353,7 +517,7 @@ internal/emulator    Semantic JS engine (goja sandbox + instrumented sinks)
 internal/fetcher     HTTP fetching and HTML parsing
 internal/graph       ASCII graph rendering
 internal/jsanalyzer  Static JS analysis: tokenizer, parser, request/response inference
-internal/linker      Link model, categories, and the display rules both reports print
+internal/linker      Link model, categories, references, and the display rules both reports print
 internal/markdown    Markdown report generation
 internal/patterns    URL/domain classification rules
 internal/progress    Progress bar (stderr)

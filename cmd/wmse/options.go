@@ -19,7 +19,11 @@ import (
 type options struct {
 	cfg  *config.Config
 	snap *wmse.Snapshot
-	file *wmse.File
+	// info is what the header says about where the data came from. It is the
+	// header rather than the open file, because a report does not read the file
+	// again - it reads the snapshot - and because a session can report on the
+	// union of several files, which no single handle could describe.
+	info *wmse.FileInfo
 	path string
 
 	// depth is what the tree stops at, which is -rdepth when the reader was
@@ -476,6 +480,17 @@ func trunc(s string, n int) string {
 		return s[:n]
 	}
 	return s[:n-3] + "..."
+}
+
+// pad cuts a value to a width and pads it back out, so a column keeps its width
+// whether the value in it is short or long. A width verb alone only pads: a value
+// wider than the column is left wide and pushes everything after it sideways.
+func pad(s string, n int) string {
+	s = trunc(s, n)
+	for len(s) < n {
+		s += " "
+	}
+	return s
 }
 
 func oneline(s string, n int) string {

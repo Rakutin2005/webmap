@@ -112,6 +112,11 @@ func Parse(raw []byte) (*File, error) {
 }
 
 // Info returns the header description.
+// payloadBase is the offset of the first section's bytes from the start of the
+// file. A section's recorded offset is counted from here rather than from the
+// start, so anything that wants to address a section's bytes in the file needs it.
+func (f *File) payloadBase() int { return f.base }
+
 func (f *File) Info() *FileInfo { return f.info }
 
 // Has reports whether the file carries a section.
@@ -241,6 +246,8 @@ func (f *File) Load() (*Snapshot, error) {
 		{"params", SecParams, readParams},
 		{"emulation", SecEmulation, readEmulation},
 		{"edges", SecEdges, readEdges},
+		{"archive", SecArchive, readArchive},
+		{"signature", SecSignature, readSignature},
 	} {
 		if !f.Has(s.id) {
 			continue
@@ -430,6 +437,36 @@ func (f *File) loadTables() error {
 		}
 	}
 	f.dec = dec
+	return nil
+}
+
+// readArchive restores the sidecar tar and the list of what is inside it. The
+// tar is kept opaque: the format stores files, not a vocabulary of files, so
+// this layer never has to learn what a .ref file means in order to carry it.
+func readArchive(r *byteReader, d *decoder, snap *Snapshot) error {
+	n, err := r.count(len(r.buf) + 1)
+	if err != nil {
+		return err
+	}
+	names := make([]string, n)
+	for i := range names {
+		id, err := r.uvarint()
+		if err != nil {
+			return err
+		}
+		if names[i], err = d.str(uint32(id)); err != nil {
+			return err
+		}
+	}
+	size, err := r.uvarint()
+	if err != nil {
+		return err
+	}
+	if size > uint64(len(r.buf)-r.pos) {
+		return ErrTruncated
+	}
+	snap.Archive = r.buf[r.pos : r.pos+int(size)]
+	snap.ArchiveNames = names
 	return nil
 }
 

@@ -71,6 +71,19 @@ const (
 	SecParams
 	SecEmulation
 	SecDicts
+	// SecArchive is a tar of the files the scan kept alongside its graph: today
+	// the per-source .ref files that say where each link was found. It is a
+	// separate section, and uncompressed within it, so that adding a kind of
+	// file later is a change to one section rather than to every link record,
+	// and so a reader that does not want the files never inflates them.
+	SecArchive
+	// SecSignature holds a signature over the rest of the file, and SecSealed marks
+	// a file that is encrypted rather than merely signed. Both are separate
+	// sections rather than fields in the metadata, so a reader that does not care
+	// about either never has to look, and a file that has neither is byte for byte
+	// what it was before these existed.
+	SecSignature
+	SecSealed
 	secCount
 )
 
@@ -87,6 +100,9 @@ var sectionNames = [secCount]string{
 	SecParams:       "params",
 	SecEmulation:    "emulation",
 	SecDicts:        "dicts",
+	SecArchive:      "archive",
+	SecSignature:    "signature",
+	SecSealed:       "sealed",
 }
 
 // SectionName returns the readable name of a section id.

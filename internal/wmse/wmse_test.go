@@ -529,3 +529,42 @@ func TestSectionNamesAndEdgesAreDocumented(t *testing.T) {
 		t.Errorf("magic %q", Magic)
 	}
 }
+
+// TestWritingASnapshotTwiceDoesNotDoubleItsRelations covers the round trip a
+// session's save makes: a file is read, added to, and written back.
+//
+// The writer derives the relations from the links, and a snapshot read back from
+// a file already carries the relations a previous write derived from it. Deriving
+// those again reproduces them exactly, so a writer that appended the two instead
+// of unioning them would double the graph of every file it was asked to re-save -
+// and a session that saved a file ten times would carry a hundred graphs' worth of
+// edges, none of them a discovery.
+func TestWritingASnapshotTwiceDoesNotDoubleItsRelations(t *testing.T) {
+	once := roundTrip(t, testSnapshot())
+	twice := roundTrip(t, once)
+	thrice := roundTrip(t, twice)
+
+	if len(once.Edges) == 0 {
+		t.Fatalf("the fixture derived no relations, so this proves nothing")
+	}
+	if len(twice.Edges) != len(once.Edges) {
+		t.Errorf("writing a file again changed its relations from %d to %d",
+			len(once.Edges), len(twice.Edges))
+	}
+	if len(thrice.Edges) != len(once.Edges) {
+		t.Errorf("writing a file three times left %d relations, want %d",
+			len(thrice.Edges), len(once.Edges))
+	}
+	// The doubling was not a reshuffle: the same relations twice over is what a
+	// reader of the graph sees as a site twice as connected as it is.
+	seen := map[Edge]int{}
+	for _, e := range twice.Edges {
+		seen[e]++
+	}
+	for e, n := range seen {
+		if n > 1 {
+			t.Errorf("the relation %v was written %d times", e, n)
+			break
+		}
+	}
+}

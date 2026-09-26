@@ -93,6 +93,12 @@ func viewReport(o *options) {
 	if o.cfg.Emulate && o.hasEmulation {
 		viewEmulation(o)
 	}
+	// -refs is a scan flag with a reader meaning: the scan records where each
+	// link was found, and the reader shows it. The .ref files are the evidence
+	// the flag produced, kept beside the graph in the file's archive section.
+	if o.cfg.Refs {
+		viewRefs(o)
+	}
 	if o.cfg.Graphical && o.hasRelations {
 		viewGraph(o)
 	}
@@ -112,7 +118,7 @@ func viewHeader(o *options) {
 		return
 	}
 	o.headerShown = true
-	snap, info := o.snap, o.file.Info()
+	snap, info := o.snap, o.info
 	sections := "1 section"
 	if len(info.Sections) != 1 {
 		sections = fmt.Sprintf("%d sections", len(info.Sections))
@@ -156,7 +162,7 @@ func viewHeader(o *options) {
 // is indistinguishable from a section the file cannot answer. So the flags go
 // where the missing sections would be.
 func viewFlagsHint(o *options) {
-	fmt.Printf("\n  %s\n", o.dim("the flags that shape this report: -r -apic -apic-raw -apif -emulate -G -j -nogroup"))
+	fmt.Printf("\n  %s\n", o.dim("the flags that shape this report: -r -apic -apic-raw -apif -emulate -G -j -refs -nogroup"))
 	fmt.Printf("  %s\n", o.dim("and the ones that shape what it covers: -url -a -f -rdepth -rlimit -t -waf -cdn -cache -noise -full -color"))
 }
 
@@ -180,7 +186,7 @@ func (o *options) holds() string {
 // almost nothing even on a large file.
 func viewInfo(o *options) {
 	viewHeader(o)
-	info := o.file.Info()
+	info := o.info
 
 	o.heading("Storage")
 	fmt.Printf("  %-14s %-6s %10s %10s %7s\n", "section", "codec", "stored", "raw", "ratio")
@@ -331,8 +337,12 @@ func (o *options) linkRow(l *linker.Link) string {
 		cat = l.Tag
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%-6s %-11s %-24s %s", l.LinkType.String(), cat,
-		trunc(l.Domain, 24), l.HREF)
+	// Both columns are cut to their width before they are padded. A tag can be
+	// any length, and one wider than its column would push the domain and the href
+	// sideways on that row alone, which is the difference between a table and a
+	// list. The value is still readable, and the row still carries the whole href.
+	fmt.Fprintf(&b, "%-6s %s %s %s", l.LinkType.String(), pad(cat, 11),
+		pad(l.Domain, 24), l.HREF)
 	if l.Resolved != "" && l.Resolved != l.HREF {
 		fmt.Fprintf(&b, " -> %s", l.Resolved)
 	}
@@ -872,6 +882,49 @@ func viewEmulation(o *options) {
 	for _, e := range em.Errors {
 		if !o.out("  ERROR  " + oneline(e, 200)) {
 			return
+		}
+	}
+}
+
+// viewRefs shows where each link was found, read from the .ref sidecar files
+// the scan's -refs produced. It is the answer to "this page links to /admin -
+// show me where", which no other section of the report can give, because only
+// the references know a position inside the source document.
+func viewRefs(o *options) {
+	o.heading("References")
+	if len(o.snap.ArchiveNames) == 0 {
+		fmt.Printf("  %s\n", o.dim("this file holds no references: the scan was run without -refs"))
+		return
+	}
+	// The archive is the evidence; the file names inside it are the index.
+	// Showing what is available, and then the entries for the current target,
+	// is the useful order: a reader wants to know a reference exists before
+	// they want to read all of them.
+	// The archive also holds files a session saved, so the references are named
+	// as references and the rest are counted beside them: a section that listed a
+	// saved script among the reference files would be describing an archive that
+	// does not exist.
+	refs := refNames(o.snap.ArchiveNames)
+	fmt.Printf("  %s\n", o.dim(fmt.Sprintf("%d reference file(s) in the archive section", len(refs))))
+	for _, name := range refs {
+		if !o.out("    " + name) {
+			return
+		}
+	}
+	// The entry point's own references, if the archive kept them, are the ones
+	// a reader almost always wants first.
+	target := o.target
+	if target != "" {
+		if data, err := o.snap.ArchiveFileBySource(target); err == nil {
+			fmt.Printf("\n  %s\n", o.bold("in "+target+":"))
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.TrimSpace(line) == "" {
+					continue
+				}
+				if !o.out("    " + line) {
+					return
+				}
+			}
 		}
 	}
 }

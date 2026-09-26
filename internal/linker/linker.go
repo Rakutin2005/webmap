@@ -264,62 +264,114 @@ var cssImportRegex = regexp.MustCompile(`(?i)@import\s+['"]([^"']+)['"]`)
 var jsImportRegex = regexp.MustCompile(`(?i)(?:^|[^a-z0-9_.$])(?:import|export|from|require)\b\s*\(?\s*["']([^"']{1,512})["']`)
 
 func Parse(body string, sourceURL string) []Link {
+	return ParseWithRefs(body, sourceURL, nil)
+}
+
+// ParseWithRefs is Parse plus, when ix is non-nil, a reference for every link it
+// finds: the offset of the match, its line and column, and the text around it,
+// filed under sourceURL.
+//
+// The reference work is behind a nil check so a scan that did not ask for
+// references runs the same regex pass it always did, with no line counting and
+// no per-link snippet. That is the difference between a flag that costs
+// something and a flag that costs nothing until it is used.
+func ParseWithRefs(body string, sourceURL string, ix *RefIndex) []Link {
 	links := make([]Link, 0)
 
-	links = append(links, findLinks(linkTagRegex, body, sourceURL, "a")...)
-	links = append(links, findLinks(scriptTagRegex, body, sourceURL, "script")...)
-	links = append(links, findLinks(linkTagRegex2, body, sourceURL, "link")...)
-	links = append(links, findLinks(imgTagRegex, body, sourceURL, "img")...)
-	links = append(links, findLinks(sourceTagRegex, body, sourceURL, "source")...)
-	links = append(links, findLinks(videoTagRegex, body, sourceURL, "video")...)
-	links = append(links, findLinks(audioTagRegex, body, sourceURL, "audio")...)
-	links = append(links, findLinks(iframeTagRegex, body, sourceURL, "iframe")...)
-	links = append(links, findLinks(cssImportRegex, body, sourceURL, "css-import")...)
-	links = append(links, findLinks(jsImportRegex, body, sourceURL, "js-import")...)
+	links = append(links, findLinks(linkTagRegex, body, sourceURL, "a", ix)...)
+	links = append(links, findLinks(scriptTagRegex, body, sourceURL, "script", ix)...)
+	links = append(links, findLinks(linkTagRegex2, body, sourceURL, "link", ix)...)
+	links = append(links, findLinks(imgTagRegex, body, sourceURL, "img", ix)...)
+	links = append(links, findLinks(sourceTagRegex, body, sourceURL, "source", ix)...)
+	links = append(links, findLinks(videoTagRegex, body, sourceURL, "video", ix)...)
+	links = append(links, findLinks(audioTagRegex, body, sourceURL, "audio", ix)...)
+	links = append(links, findLinks(iframeTagRegex, body, sourceURL, "iframe", ix)...)
+	links = append(links, findLinks(cssImportRegex, body, sourceURL, "css-import", ix)...)
+	links = append(links, findLinks(jsImportRegex, body, sourceURL, "js-import", ix)...)
 
 	return deduplicate(links)
 }
 
-func findLinks(regex *regexp.Regexp, body string, sourceURL string, tag string) []Link {
-	matches := regex.FindAllStringSubmatch(body, -1)
-	links := make([]Link, 0, len(matches))
-
-	for _, match := range matches {
-		if len(match) < 2 {
-			continue
+func findLinks(regex *regexp.Regexp, body string, sourceURL string, tag string, ix *RefIndex) []Link {
+	var links []Link
+	if ix == nil {
+		// The ordinary path: matches without positions, which is all the
+		// scan needs when nothing is recording where things were found.
+		matches := regex.FindAllStringSubmatch(body, -1)
+		links = make([]Link, 0, len(matches))
+		for _, match := range matches {
+			if l, ok := linkFromMatch(match, sourceURL, tag); ok {
+				links = append(links, l)
+			}
 		}
-		href := match[1]
-		href = strings.TrimSpace(href)
-		if tag == "js-import" && !isValidModuleSpecifier(href) {
-			continue
-		}
-		if href == "" || strings.HasPrefix(href, "#") || strings.HasPrefix(href, "javascript:") || strings.HasPrefix(href, "mailto:") || strings.HasPrefix(href, "tel:") {
-			continue
-		}
-		if !hasValidURLChars(href) {
-			continue
-		}
-
-		linkType := determineLinkType(href)
-		category := categorize(href)
-		class := ClassifyURL(href)
-		hasParams := false
-		if idx := strings.IndexByte(href, '?'); idx >= 0 && idx < len(href)-1 && !strings.HasPrefix(href, "?") {
-			hasParams = true
-		}
-
-		links = append(links, Link{
-			HREF:      href,
-			Category:  category,
-			LinkType:  linkType,
-			Class:     class,
-			HasParams: hasParams,
-			SourceURL: sourceURL,
-			Tag:       tag,
-		})
+		return links
 	}
 
+	// With references, the submatch indices carry the byte offsets of each
+	// group, so the same match that becomes a link also becomes a position.
+	indices := regex.FindAllStringSubmatchIndex(body, -1)
+	links = make([]Link, 0, len(indices))
+	for _, idx := range indices {
+		if len(idx) < 4 || idx[2] < 0 {
+			continue
+		}
+		// idx[2], idx[3] bound group 1, the URL itself; the reference points
+		// at the URL rather than the whole tag, because that is the token a
+		// reader will search for.
+		match := make([]string, 2)
+		match[1] = body[idx[2]:idx[3]]
+		if l, ok := linkFromMatch(match, sourceURL, tag); ok {
+			links = append(links, l)
+		}
+		line, col := lineColumn(body, idx[2])
+		ix.Add(sourceURL, "", Reference{
+			Target:  match[1],
+			Offset:  idx[2],
+			Line:    line,
+			Column:  col,
+			Snippet: makeSnippet(body, idx[2], idx[3]-idx[2]),
+		})
+	}
 	return links
+}
+
+// linkFromMatch builds a link from a regex match whose first submatch is the
+// href, applying the same accept/reject rules for every tag. A rejected match
+// yields no link and therefore no reference: the position of something the scan
+// chose to ignore is not evidence of anything.
+func linkFromMatch(match []string, sourceURL string, tag string) (Link, bool) {
+	if len(match) < 2 {
+		return Link{}, false
+	}
+	href := match[1]
+	href = strings.TrimSpace(href)
+	if tag == "js-import" && !isValidModuleSpecifier(href) {
+		return Link{}, false
+	}
+	if href == "" || strings.HasPrefix(href, "#") || strings.HasPrefix(href, "javascript:") || strings.HasPrefix(href, "mailto:") || strings.HasPrefix(href, "tel:") {
+		return Link{}, false
+	}
+	if !hasValidURLChars(href) {
+		return Link{}, false
+	}
+
+	linkType := determineLinkType(href)
+	category := categorize(href)
+	class := ClassifyURL(href)
+	hasParams := false
+	if idx := strings.IndexByte(href, '?'); idx >= 0 && idx < len(href)-1 && !strings.HasPrefix(href, "?") {
+		hasParams = true
+	}
+
+	return Link{
+		HREF:      href,
+		Category:  category,
+		LinkType:  linkType,
+		Class:     class,
+		HasParams: hasParams,
+		SourceURL: sourceURL,
+		Tag:       tag,
+	}, true
 }
 
 func determineLinkType(href string) LinkType {
@@ -649,13 +701,22 @@ func (p ParamRef) OwnerLabel() string {
 //
 // Nothing here performs network I/O: it is purely lexical analysis.
 func AnalyzeJS(js string, sourceURL string) (templates []Link) {
+	return AnalyzeJSWithRefs(js, sourceURL, nil)
+}
+
+// AnalyzeJSWithRefs is AnalyzeJS plus, when ix is non-nil, a reference for each
+// template literal, pointing at the offset of the literal in the script. A
+// dynamic URL found in a bundle is one of the harder things to trace back by
+// hand, so the position is worth as much here as it is for an HTML attribute.
+func AnalyzeJSWithRefs(js string, sourceURL string, ix *RefIndex) (templates []Link) {
 
 	seenTmpl := make(map[string]bool)
-	for _, m := range tmplLiteralRegex.FindAllStringSubmatch(js, -1) {
-		if len(m) < 2 || !strings.Contains(m[1], "${") {
+	for _, m := range tmplLiteralRegex.FindAllStringSubmatchIndex(js, -1) {
+		if len(m) < 4 || m[2] < 0 || !strings.Contains(js[m[2]:m[3]], "${") {
 			continue
 		}
-		norm := tmplInterpRegex.ReplaceAllStringFunc(m[1], templatePlaceholder)
+		raw := js[m[2]:m[3]]
+		norm := tmplInterpRegex.ReplaceAllStringFunc(raw, templatePlaceholder)
 		norm = cleanDynamicTemplate(norm)
 		if norm == "" || strings.Count(norm, "{") > 8 {
 			continue
@@ -679,6 +740,16 @@ func AnalyzeJS(js string, sourceURL string) (templates []Link) {
 			SourceURL: sourceURL,
 			Tag:       "url-tmpl",
 		})
+		if ix != nil {
+			line, col := lineColumn(js, m[2])
+			ix.Add(sourceURL, "", Reference{
+				Target:  norm,
+				Offset:  m[2],
+				Line:    line,
+				Column:  col,
+				Snippet: makeSnippet(js, m[2], m[3]-m[2]),
+			})
+		}
 	}
 	return templates
 }

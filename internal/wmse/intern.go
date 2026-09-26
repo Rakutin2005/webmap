@@ -235,6 +235,13 @@ func walk(s *Snapshot, in interner) {
 		in.Str(t)
 	}
 
+	// The sidecar archive's entry names are string-table entries like any
+	// other literal, so they are interned in the collect pass and referenced by
+	// id in the encode pass.
+	for _, name := range s.ArchiveNames {
+		in.Str(name)
+	}
+
 	for i := range s.Links {
 		l := &s.Links[i]
 		in.Str(l.HREF)
@@ -401,10 +408,17 @@ func newEncoderState(snap *Snapshot, idx map[string]uint32) *encoderState {
 		ordered: []uint8{
 			SecMeta, SecStats, SecStrings, SecLinks, SecEdges, SecGroups,
 			SecEndpoints, SecObservations, SecParams, SecEmulation, SecDicts,
+			SecArchive, SecSealed,
 		},
 		links:   sortedLinks(snap.Links),
 		nodeOf:  make(map[string]uint32, len(snap.Links)),
 		pageSet: make(map[string]Page, len(snap.Pages)),
+	}
+	// The signature section is added only for a file that has one. A section that
+	// is present but empty would have to be read as "this file makes a claim that
+	// is blank", which is a third thing - and the one nobody means.
+	if snap.Signature != nil {
+		st.ordered = append(st.ordered, SecSignature)
 	}
 	for i := range st.links {
 		if _, dup := st.nodeOf[LinkKey(&st.links[i])]; !dup {

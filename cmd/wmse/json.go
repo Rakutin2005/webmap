@@ -406,6 +406,19 @@ func (e *jsonEncoder) encode(snap *wmse.Snapshot) error {
 		e.objEnd()
 	}
 
+	// The sidecar archive is opaque here: the JSON names what is inside it
+	// without inlining the files, because the .ref files are the record of
+	// where each link was found and a consumer that wants them reads them by
+	// name out of the archive. The bytes themselves would double the document
+	// for something the file already holds.
+	if len(snap.ArchiveNames) > 0 {
+		e.key("archive")
+		e.objStart()
+		e.stringArray("files", snap.ArchiveNames)
+		e.num("bytes", len(snap.Archive))
+		e.objEnd()
+	}
+
 	e.objEnd()
 	e.put("\n")
 	return e.err

@@ -17,7 +17,7 @@ import (
 
 // Version is the tool version recorded in a saved scan. It is a constant rather
 // than a build flag so that a file always names the build that produced it.
-const Version = "1.0.0"
+const Version = "1.3.3"
 
 // saveSnapshot writes the whole scan to a static-explorer file.
 //
@@ -27,7 +27,7 @@ const Version = "1.0.0"
 // showed would be smaller to write but would have thrown away the evidence,
 // and the evidence is the reason to save a scan at all.
 func saveSnapshot(path string, cfg *config.Config, allLinks []linker.Link, started time.Time) {
-	snap := buildSnapshot(path, cfg, allLinks, started)
+	snap := buildSnapshot(path, cfg, allLinks, refIndex, started)
 	opts := wmse.DefaultOptions()
 	if cfg.OutputRaw {
 		opts.Compress = false
@@ -52,6 +52,10 @@ func saveSnapshot(path string, cfg *config.Config, allLinks []linker.Link, start
 	if snap.Meta[wmse.MetaSessionData] == "true" {
 		fmt.Fprintf(os.Stderr, "\nNote: %s holds the requests this scan really sent, which can include session\n"+
 			"      material (tokens, cookies, ids). Treat the file as a secret.\n", path)
+	}
+	if n := len(snap.ArchiveNames); n > 0 {
+		fmt.Printf("\n  %d reference file(s) in the archive section; read one with:\n"+
+			"    wmse read %s -refs\n", n, path)
 	}
 }
 
@@ -91,7 +95,7 @@ func humanBytes(n int64) string {
 // buildSnapshot converts the scan's live state into the format's model. It is
 // the only place that knows both sides, so the format package stays free of
 // the emulator and the report's own types.
-func buildSnapshot(path string, cfg *config.Config, allLinks []linker.Link, started time.Time) *wmse.Snapshot {
+func buildSnapshot(path string, cfg *config.Config, allLinks []linker.Link, refs *linker.RefIndex, started time.Time) *wmse.Snapshot {
 	obsMu.Lock()
 	obs := append([]contract.Observation(nil), obsPool...)
 	obsMu.Unlock()
@@ -112,6 +116,10 @@ func buildSnapshot(path string, cfg *config.Config, allLinks []linker.Link, star
 	// inferred no contracts and emulated nothing, so normalization runs
 	// unconditionally.
 	_ = snap.Normalize(cfg.URL)
+	// References become the sidecar archive: one .ref file per source document.
+	// A failure here must not lose the graph the file already holds, so the
+	// error is dropped and the file simply has no archive.
+	_ = wmse.BuildRefsArchive(snap, refs)
 	// The counts go in after normalization, so they describe the file rather
 	// than the scan: a reader can size itself from the meta section alone.
 	snap.Meta[wmse.MetaLinks] = fmt.Sprint(len(snap.Links))
@@ -119,6 +127,9 @@ func buildSnapshot(path string, cfg *config.Config, allLinks []linker.Link, star
 	snap.Meta[wmse.MetaEndpoints] = fmt.Sprint(len(snap.Endpoints))
 	snap.Meta[wmse.MetaPatterns] = fmt.Sprint(len(snap.Groups))
 	snap.Meta[wmse.MetaParams] = fmt.Sprint(len(snap.Params))
+	if n := len(snap.ArchiveNames); n > 0 {
+		snap.Meta[wmse.MetaArchiveFiles] = fmt.Sprint(n)
+	}
 	return snap
 }
 

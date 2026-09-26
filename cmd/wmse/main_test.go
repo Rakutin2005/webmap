@@ -29,8 +29,8 @@ var scanFlags = []string{
 	"-cache", "-cdn", "-cf", "-color", "-cookie", "-emu-maxjobs", "-emu-maxjs",
 	"-emu-maxleaks", "-emu-timeout", "-emu-workers", "-emulate", "-f", "-follow",
 	"-full", "-group-count", "-headers-all-hosts", "-j", "-k", "-nogroup",
-	"-noise", "-o", "-o-raw", "-patterns", "-r", "-rdepth", "-react", "-rlimit",
-	"-str", "-t", "-url", "-waf", "-wp",
+	"-noise", "-o", "-o-raw", "-patterns", "-r", "-rdepth", "-react", "-refs",
+	"-rlimit", "-str", "-t", "-url", "-waf", "-wp",
 }
 
 // capture runs fn with stdout redirected and returns what it printed. The views
@@ -133,7 +133,7 @@ func opened(t *testing.T, path string, args ...string) *options {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	o := &options{cfg: cfg, snap: snap, file: f, path: path, depth: readDepth(cfg, fs)}
+	o := &options{cfg: cfg, snap: snap, info: f.Info(), path: path, depth: readDepth(cfg, fs)}
 	o.setup()
 	return o
 }
@@ -227,7 +227,14 @@ func testSnapshot() *wmse.Snapshot {
 // produced rather than against something shaped like it.
 func testFile(t *testing.T) string {
 	t.Helper()
-	snap := testSnapshot()
+	return writeFixture(t, testSnapshot())
+}
+
+// writeFixture normalises and writes a snapshot the way the scan would, and
+// returns the path. Tests that need a specific file build their own snapshot
+// and hand it here so they go through the real writer.
+func writeFixture(t *testing.T, snap *wmse.Snapshot) string {
+	t.Helper()
 	if err := snap.Normalize("https://example.com/"); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
@@ -236,6 +243,43 @@ func testFile(t *testing.T) string {
 		t.Fatalf("write: %v", err)
 	}
 	return path
+}
+
+// TestRefsAreShownWhenAskedFor covers the reader half of -refs: the flag means
+// "show me where each link was found" against the .ref sidecar the scan wrote.
+// A file with no references must say so rather than printing an empty section,
+// which would read as "nothing was found anywhere".
+func TestRefsAreShownWhenAskedFor(t *testing.T) {
+	ix := linker.NewRefIndex()
+	ix.Add("https://example.com/", "text/html", linker.Reference{
+		Offset: 12, Line: 1, Column: 13, Snippet: `<a href="/admin">`,
+	})
+	snap := testSnapshot()
+	if err := wmse.BuildRefsArchive(snap, ix); err != nil {
+		t.Fatalf("BuildRefsArchive: %v", err)
+	}
+	path := writeFixture(t, snap)
+
+	got := exercise(t, "read", path, "-refs")
+	if got.err != nil {
+		t.Fatalf("read -refs: %v\n%s", got.err, got.stderr)
+	}
+	out := got.out()
+	for _, want := range []string{"=== References ===", "1 reference file", "12\t1:13", "<a href="} {
+		if !strings.Contains(out, want) {
+			t.Errorf("-refs output missing %q:\n%s", want, out)
+		}
+	}
+	// Without the flag the section is absent: the report is the scan's report,
+	// and the scan does not print references by default.
+	if plain := exercise(t, "read", path); strings.Contains(plain.out(), "=== References ===") {
+		t.Errorf("references printed without -refs:\n%s", plain.out())
+	}
+	// A file with no references says so instead of pretending.
+	bare := exercise(t, "read", testFile(t), "-refs")
+	if !strings.Contains(bare.out(), "without -refs") {
+		t.Errorf("a file with no references did not say so:\n%s", bare.out())
+	}
 }
 
 // TestReaderTakesTheScansArguments is the promise the whole command is built on:
@@ -260,19 +304,123 @@ func TestReaderTakesTheScansArguments(t *testing.T) {
 	}
 }
 
-// TestUsageOnlyMentionsFlagsThatExist keeps the help honest in the other
-// direction: a flag documented here that the reader does not take is a
-// documented lie, and a reader that answers a request it cannot fill is worse
-// than one that never promised to.
+// TestLinkRowsLineUpWhateverTheRowHolds: every row has to put the href in the
+// same place, or the table is a list. A tag is any length, and one wider than its
+// column used to push the domain and the href sideways on that row alone - which
+// is invisible in a test that only uses short tags and glaring on a real page.
+func TestLinkRowsLineUpWhateverTheRowHolds(t *testing.T) {
+	cfg, _ := newFlagSet()
+	o := &options{cfg: cfg}
+	cols := map[int]int{}
+	for _, l := range []*linker.Link{
+		{HREF: "/a", Category: linker.CategoryWebPage, LinkType: linker.LinkTypeRelative, Domain: "example.com"},
+		{HREF: "/b", Category: linker.CategoryWebAsset, LinkType: linker.LinkTypeAbsolute, Domain: "a-very-long-subdomain.example.net", Tag: "static"},
+		// The tag is wider than the column it sits in.
+		{HREF: "/c", Category: linker.CategoryWebAsset, LinkType: linker.LinkTypeRelative, Domain: "e.com", Tag: "a-rather-long-tag-name"},
+	} {
+		row := visibleOnly(o.linkRow(l))
+		cols[strings.Index(row, l.HREF)]++
+	}
+	if len(cols) != 1 {
+		t.Errorf("the hrefs of a table start at %d different columns: %v", len(cols), cols)
+	}
+}
+
+// TestPadKeepsAColumnItsWidth is the unit behind that: a value wider than the
+// column is cut, and a value narrower is padded to it.
+func TestPadKeepsAColumnItsWidth(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"ab", 6, "ab    "},
+		{"", 4, "    "},
+		{"abcdef", 6, "abcdef"},
+		{"abcdefghij", 6, "abc..."},
+		{"abc", 3, "abc"},
+	} {
+		if got := pad(c.in, c.n); got != c.want {
+			t.Errorf("pad(%q, %d) = %q, want %q", c.in, c.n, got, c.want)
+		}
+	}
+}
+
+// TestUsageOnlyMentionsFlagsThatExist guards the promise that the reader's flags
+// are the scan's flags: a usage that documented a flag the reader does not take
+// would send a person looking for a switch that does not exist.
+//
+// The assertion covers the reader's own flag documentation, which is the part of
+// the usage that lists flags. The session section lists commands, and a command
+// may take a flag of its own - `ls -d` is not a reader flag and is not claimed to
+// be - so the two are kept apart rather than the assertion weakened.
 func TestUsageOnlyMentionsFlagsThatExist(t *testing.T) {
 	_, fs := newFlagSet()
 	known := map[string]bool{}
 	fs.VisitAll(func(f *flag.Flag) { known[f.Name] = true })
-	for _, tok := range usageFlags(usage) {
-		if !known[strings.TrimPrefix(tok, "-")] {
-			t.Errorf("usage documents %s, which the reader does not take", tok)
+	for _, tok := range usageFlags(readerUsage()) {
+		name := strings.TrimPrefix(tok, "-")
+		if known[name] {
+			continue
+		}
+		// A flag the reader has of its own is allowed, but only one that is on the
+		// list: a list read from the flag set would agree with itself whatever it
+		// contained, which is the thing this assertion exists to prevent.
+		if readerOnly[name] {
+			continue
+		}
+		t.Errorf("usage documents %s, which the reader does not take", tok)
+	}
+}
+
+// readerOnlyFlags are the flags the reader has that the scan does not. They are
+// listed rather than derived, for the same reason scanFlags is: a list derived
+// from the code under test proves nothing.
+//
+// There is one, and it is deliberately not in the flag set. The reader's flags are
+// the scan's flags one for one, and that is what makes a scan's command line
+// replayable against its own file; a reader-only flag registered alongside them
+// would either break that promise or turn into a flag the scan does not have.
+// Taken out of the arguments by hand, it stays visible as what it is.
+var readerOnly = map[string]bool{"i": true}
+
+// TestReaderOnlyFlagsAreNotScanFlags: a flag that is the reader's own must not
+// also be the scan's, or the parity that the reader is built on is a coincidence
+// rather than a rule.
+func TestReaderOnlyFlagsAreNotScanFlags(t *testing.T) {
+	for name := range readerOnly {
+		if scanHasFlag(name) {
+			t.Errorf("-%s is documented as the reader's own, and the scan has it too", name)
+		}
+		key, _ := takeKeyFlag([]string{"-" + name, "k"})
+		if key != "k" {
+			t.Errorf("-%s is documented but is not taken out of the arguments", name)
 		}
 	}
+}
+
+// scanHasFlag asks the scan's own registration whether it has a flag of that name.
+// The config has no lookup of its own, and adding one for a test would be worse than
+// registering the flags again and looking.
+func scanHasFlag(name string) bool {
+	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
+	found := false
+	config.Register(fs)
+	fs.VisitAll(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+// readerUsage is the part of the usage that documents the reader: everything
+// before the session section, which is about commands rather than flags.
+func readerUsage() string {
+	if i := strings.Index(usage, "The select session"); i >= 0 {
+		return usage[:i]
+	}
+	return usage
 }
 
 // TestUsageSpellsFlagsWithOneDash pins the spelling. Every flag in WebMap is

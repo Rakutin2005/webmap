@@ -5,6 +5,7 @@ go 1.26.2
 require (
 	github.com/dop251/goja v0.0.0-20260701091749-b07b74453ea9
 	golang.org/x/net v0.30.0
+	golang.org/x/sys v0.38.0
 )
 
 require (

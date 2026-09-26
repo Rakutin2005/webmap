@@ -263,6 +263,14 @@ func buildRuns(edges []Edge) []edgeRun {
 // the writer has one place that decides what is a relation. It appends to a
 // working list rather than to the snapshot, so writing a snapshot twice does
 // not double the graph.
+//
+// The snapshot's own edges are unioned in, for a caller that supplied a relation
+// the model cannot express. They are unioned and not appended, because a snapshot
+// read back from a file carries the edges a previous write derived from it, and
+// re-deriving those from the links reproduces them exactly - so appending would
+// double the graph of every file that is loaded and written again. That is what a
+// session's save does, and a file should not be able to double itself down a
+// path like that.
 func (st *encoderState) deriveEdges() []Edge {
 	links := st.links
 	var edges []Edge
@@ -340,7 +348,21 @@ func (st *encoderState) deriveEdges() []Edge {
 	}
 
 	// Whatever the collector already asserted stays: it is not re-derived.
-	return append(edges, st.snap.Edges...)
+	// Union in the snapshot's own edges, skipping any the derivation already
+	// produced. The set is keyed on the whole edge, so a caller-supplied relation
+	// that happens to be one the model could derive is not written twice.
+	seen := make(map[Edge]bool, len(edges)+len(st.snap.Edges))
+	for _, e := range edges {
+		seen[e] = true
+	}
+	for _, e := range st.snap.Edges {
+		if seen[e] {
+			continue
+		}
+		seen[e] = true
+		edges = append(edges, e)
+	}
+	return edges
 }
 
 // writeGroups emits the URL patterns; membership lives in the edge section.
@@ -536,4 +558,23 @@ func (st *encoderState) writeEmulation() {
 		w.uvarint(uint64(st.enc.Pairs(nameValuePairs(callHeaders(c)))))
 	}
 	st.put(SecEmulation, w.buf)
+}
+
+// writeArchive emits the sidecar files as a tar: a count, the entry names as
+// table ids so the reader can list them without opening the tar, then the tar
+// itself.
+//
+// The names come first because "what is in here" is the question a reader asks
+// before "what is in any of it", and answering it should not require inflating
+// the payload.
+func (st *encoderState) writeArchive() {
+	arch := st.snap.Archive
+	w := byteWriter{}
+	w.uvarint(uint64(len(st.snap.ArchiveNames)))
+	for _, name := range st.snap.ArchiveNames {
+		w.uvarint(uint64(st.str(name)))
+	}
+	w.uvarint(uint64(len(arch)))
+	w.bytes(arch)
+	st.put(SecArchive, w.buf)
 }

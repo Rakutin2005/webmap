@@ -58,6 +58,12 @@ type Config struct {
 	// this exists for a reader that wants to mmap a section and would rather
 	// not pay for inflation.
 	OutputRaw bool
+	// Refs asks the scan to record, for every link, where in the source
+	// document it was discovered: the file, the byte offset, the line and
+	// column, and the text around it. The references are stored as a .ref file
+	// per source inside the -o file's sidecar archive, so it is only meaningful
+	// with -o; without it, -refs is an error rather than a silent no-op.
+	Refs bool
 
 	// The values of the flags that only mean something once every flag has been
 	// seen, and of the ones that are only an alias of another. They are fields
@@ -119,6 +125,7 @@ func Register(fs *flag.FlagSet) *Config {
 	fs.IntVar(&c.GroupCount, "group-count", 2, "Minimum number of matching URLs before they are folded into a pattern (default: 2)")
 	fs.StringVar(&c.Output, "o", "", "Write a static-explorer file (wmse) with the whole scan; read it later with: wmse read <path>")
 	fs.BoolVar(&c.OutputRaw, "o-raw", false, "Store the -o file without section compression (larger, but reads without inflating)")
+	fs.BoolVar(&c.Refs, "refs", false, "Record where each link was found (source file, byte offset, line:col, context) in the -o file's .ref sidecar; requires -o")
 
 	fs.StringVar(&c.followFlag, "follow", "", "Comma-separated additional domains to include in the recursive crawl (subdomains included)")
 	fs.StringVar(&c.followAlias, "f", "", "Alias of -follow")

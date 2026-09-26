@@ -56,6 +56,12 @@ func CodecName(codec uint8) string {
 }
 
 // Write serialises a snapshot to a file.
+//
+// The bytes go to a temporary file beside the target and are renamed over it, so
+// a write that fails - a full disk, a closed file, a container that filled up
+// half way through - leaves the file that was already there untouched. A scan can
+// be an hour of somebody's time, and a tool that can lose one to an interrupted
+// write is a tool that gets used on a copy from then on.
 func Write(path string, snap *Snapshot, opts Options) (*FileInfo, error) {
 	if snap == nil {
 		return nil, errors.New("nil snapshot")
@@ -69,10 +75,42 @@ func Write(path string, snap *Snapshot, opts Options) (*FileInfo, error) {
 			return nil, err
 		}
 	}
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
+	if err := writeFileAtomic(path, raw); err != nil {
 		return nil, err
 	}
 	return info, nil
+}
+
+// writeFileAtomic writes the bytes beside the target and renames them over it.
+// The temporary file is in the same directory so the rename stays within one
+// filesystem, which is what makes it atomic; a temporary file elsewhere would be
+// a copy, and a copy is the thing being avoided.
+func writeFileAtomic(path string, raw []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // a no-op once the rename has happened
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		return err
+	}
+	// The data has to be on the disk before the rename, or a crash can leave a
+	// file that is named but empty - which is worse than no file, because it
+	// looks like a scan that found nothing.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // sectionImage is one section's payload, both as encoded and as stored.
@@ -114,6 +152,8 @@ func Marshal(snap *Snapshot, opts Options) ([]byte, *FileInfo, error) {
 	st.writeParams()
 	st.writeEmulation()
 	st.writeDicts()
+	st.writeArchive()
+	st.writeSignature()
 
 	// Compress before the directory is laid out, so the directory can carry
 	// both the stored and the logical size of every section.

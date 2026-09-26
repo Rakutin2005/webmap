@@ -56,6 +56,12 @@ var (
 	pageLog = map[string]wmse.Page{}
 )
 
+// refIndex collects where each link was found, for the -o file's .ref sidecar.
+// It is nil unless -refs was given, so a scan that did not ask for references
+// takes the no-reference branch at every parse site. It carries its own lock,
+// so the crawl's workers may record into it directly.
+var refIndex *linker.RefIndex
+
 // recordPage notes one fetched page. A URL fetched more than once keeps the
 // shallowest sighting, because that is the path a person can walk, and the
 // largest link count, because that is the richer view of what is on it.
@@ -413,6 +419,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: URL is required")
 		os.Exit(1)
 	}
+	if cfg.Refs && cfg.Output == "" {
+		fmt.Fprintln(os.Stderr, "Error: -refs requires -o (references are stored in the file's .ref sidecar)")
+		os.Exit(1)
+	}
+	// The reference index is shared by the single-page and crawl paths and
+	// updated from the crawl's workers; it has its own lock, so it is only
+	// created when the scan was actually asked for references. Left nil, every
+	// parse site takes its "no references" branch and pays nothing.
+	if cfg.Refs {
+		refIndex = linker.NewRefIndex()
+	}
 
 	activePatterns = patterns.Defaults()
 	for _, preset := range cfg.Presets {
@@ -473,13 +490,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		allLinks := linker.Parse(result.Body, result.URL)
+		allLinks := linker.ParseWithRefs(result.Body, result.URL, refIndex)
+		if refIndex != nil {
+			refIndex.SetContentType(result.URL, result.Headers.Get("Content-Type"))
+		}
 		enrichLinks(allLinks, f)
 		if cfg.AnalyzeJS {
 			if isJSURL(result.URL) {
 				jsLinks, jsObs, fragParams := jsanalyzer.ParseWithParams(result.Body, result.URL, cfg.APIFull)
 				enrichLinks(jsLinks, f)
-				fragLinks := linker.AnalyzeJS(result.Body, result.URL)
+				fragLinks := linker.AnalyzeJSWithRefs(result.Body, result.URL, refIndex)
 				enrichLinks(fragLinks, f)
 				allLinks = append(allLinks, jsLinks...)
 				allLinks = append(allLinks, fragLinks...)
@@ -495,6 +515,9 @@ func main() {
 				if combined != "" {
 					jsLinks, jsObs, fragParams := jsanalyzer.ParseWithParams(combined, result.URL, cfg.APIFull)
 					enrichLinks(jsLinks, f)
+					// No references here: combined is a synthetic
+					// concatenation of the inline scripts, so an
+					// offset into it is not a position in the document.
 					fragLinks := linker.AnalyzeJS(combined, result.URL)
 					enrichLinks(fragLinks, f)
 					allLinks = append(allLinks, jsLinks...)
@@ -1089,13 +1112,16 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 				contentType := ""
 				if result != nil {
 					contentType = result.Headers.Get("Content-Type")
-					links = linker.Parse(result.Body, url)
+					links = linker.ParseWithRefs(result.Body, url, refIndex)
+					if refIndex != nil {
+						refIndex.SetContentType(url, contentType)
+					}
 					enrichLinks(links, f)
 					if cfg.AnalyzeJS {
 						if isJSURL(url) {
 							jsLinks, jsObs, fragParams := jsanalyzer.ParseWithParams(result.Body, url, cfg.APIFull)
 							enrichLinks(jsLinks, f)
-							fragLinks := linker.AnalyzeJS(result.Body, url)
+							fragLinks := linker.AnalyzeJSWithRefs(result.Body, url, refIndex)
 							enrichLinks(fragLinks, f)
 							links = append(links, jsLinks...)
 							links = append(links, fragLinks...)

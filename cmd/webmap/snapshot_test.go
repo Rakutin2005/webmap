@@ -93,6 +93,40 @@ func TestScanMetaSessionDataOnlyWhenCredentialsWereUsed(t *testing.T) {
 // input: everything the report knew has to reach the file, including the parts
 // the report filtered away, and the counts in the meta have to describe the file
 // rather than the scan.
+// TestBuildSnapshotCarriesReferences: when the scan collected references, the
+// snapshot's archive holds a .ref file per source, and the file's meta says how
+// many. Without references the archive is empty, which is what makes the section
+// optional rather than a per-file cost.
+func TestBuildSnapshotCarriesReferences(t *testing.T) {
+	restore := os.Args
+	defer func() { os.Args = restore }()
+	os.Args = []string{"webmap", "-url", "https://example.com/", "-o", "out.wmse", "-refs"}
+
+	pageLog = map[string]wmse.Page{}
+	defer func() { pageLog = map[string]wmse.Page{} }()
+
+	ix := linker.NewRefIndex()
+	ix.Add("https://example.com/", "text/html", linker.Reference{
+		Offset: 5, Line: 1, Column: 6, Snippet: `<a href="/x">`,
+	})
+	cfg := &config.Config{URL: "https://example.com/", Refs: true, Output: "out.wmse"}
+	snap := buildSnapshot("out.wmse", cfg, nil, ix, time.Now())
+
+	if len(snap.ArchiveNames) != 1 {
+		t.Fatalf("archive names: got %v, want one .ref", snap.ArchiveNames)
+	}
+	if got := snap.Meta[wmse.MetaArchiveFiles]; got != "1" {
+		t.Errorf("archive_files meta: got %q, want 1", got)
+	}
+	data, err := snap.ArchiveFileBySource("https://example.com/")
+	if err != nil {
+		t.Fatalf("ArchiveFileBySource: %v", err)
+	}
+	if !strings.Contains(string(data), "5\t1:6") {
+		t.Errorf("ref file does not carry the reference:\n%s", data)
+	}
+}
+
 func TestBuildSnapshotDescribesTheFile(t *testing.T) {
 	restore := os.Args
 	defer func() { os.Args = restore }()
@@ -113,7 +147,7 @@ func TestBuildSnapshotDescribesTheFile(t *testing.T) {
 			Category: linker.CategoryWebAsset, LinkType: linker.LinkTypeAbsolute, Depth: 1,
 			Class: linker.ClassCDN, SourceURL: "https://example.com/"},
 	}
-	snap := buildSnapshot("out.wmse", cfg, links, time.Now())
+	snap := buildSnapshot("out.wmse", cfg, links, nil, time.Now())
 
 	if snap.Meta[wmse.MetaTarget] != "https://example.com/" {
 		t.Errorf("target: got %q", snap.Meta[wmse.MetaTarget])

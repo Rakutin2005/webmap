@@ -22,16 +22,20 @@ import (
 	"flag"
 	"fmt"
 	"os"
-
-	"apimap/internal/wmse"
 )
 
 const usage = `wmse - WebMap Static Explorer
 
 Usage:
-  wmse read <file> [flags]   the scan's report, recomputed from the file
-  wmse info <file> [flags]   how the file is laid out, and what the scan put in it
-  wmse json <file> [flags]   the whole snapshot as JSON, for other tools
+  wmse read <file> [flags]    the scan's report, recomputed from the file
+  wmse info <file> [flags]    how the file is laid out, and what the scan put in it
+  wmse json <file> [flags]    the whole snapshot as JSON, for other tools
+  wmse select <file> [flags]  an interactive session over the file
+
+-i <key-file> is the only flag the reader has of its own, and it is the only one
+outside the scan's list: a file encrypted with an rsa or aes key is opened with it,
+and one encrypted with a password is not - there is no file to point at a password
+at, so wmse select asks for it and the other verbs say that they cannot.
 
 The flags are the scan's flags: the same names, the same meanings, the same
 defaults, so a scan command line can be replayed against its own file by changing
@@ -46,6 +50,8 @@ Read:
   -emulate      what the sandbox executed and called
   -G            the relation graph as adjacency lists
   -j            the endpoints that came out of JavaScript
+  -refs         where each link was found, from the .ref sidecar the scan's
+                -refs wrote (file, byte offset, line:col, surrounding text)
   -nogroup      leave out the URL pattern section
 
 Scope and shape:
@@ -68,6 +74,67 @@ Accepted, and ignored:
 Flags go on either side of the file, so both of these work:
   wmse read scan.wmse -r -rdepth 3
   wmse read -r scan.wmse
+
+The select session (wmse select <file>) reads one command per line at a prompt
+showing where it is standing and the name of the place. The session stands on a
+page or in a directory, and which one it is decides what ls answers:
+
+  explore@https://example.com/ [/] >            a page: ls lists its links
+  explore@https://example.com/ [users] > cd /users
+  explore@https://example.com/users [users] >   a page, so ls lists its links
+  explore@https://example.com/api [api] >       a directory, so ls lists the
+                                                paths under it
+  explore@https://example.com/api [api] > ls -d /users
+                                                ask for a path as a directory
+                                                whatever page answers for it
+
+  cd [path]        move; a page is preferred over a directory, and a directory
+                   with an index is reached through it
+  ls [path]        the current page's links, or the paths under a directory
+  ls -d [path]     ask for a path as a directory, whatever page answers for it
+  what <path>      what a path is: kind, class, where it was seen
+  from <path>      the pages that reference a resource
+  api [path]       an endpoint's contract, or why there is none
+  find <kind> <g>  search by kind and glob
+  read [flags]     the scan's whole report, with the reader's flags
+  refs [path]      where links were found, from the .ref sidecar
+  info             the header of every loaded file
+  extend <file>    open another scan and query across both
+  history          what has been typed this session
+
+read is wmse read, run from here: the same report, the same sections and the same
+gates, over the files this session has open. It takes the reader's flags, so
+"show me the whole thing again, this time with -r" needs no second command line.
+read -h lists them.
+
+With no flags, read starts from the flags the scan itself ran with, which the file
+records in its metadata - so read alone shows the report as that scan saw it, with
+the tree, the contracts and the references it asked for. A flag typed here is
+applied on top, since a flag you do not pass is one that takes its default, and
+the default is now the scan's own value. The report says which of the two it used.
+
+Tab completes - commands, then whatever the command takes: paths after cd, kinds
+after find, flags after read, files after extend. The arrows move along the line
+and walk the history. Ctrl-C abandons a line, Ctrl-D on an empty one leaves. A
+piped session reads the same lines without line editing.
+
+Four commands go outside the file, and each says which it is before it happens:
+
+  source <path> <file>  write a file out. The archive is asked first, so a file
+                         the scan kept is written without the network; what is not
+                         kept is fetched, and is NOT added to the archive - save
+                         is the command that grows the file.
+  save <path>            download a file into this file's own archive and rewrite
+                         the file. The one command that changes the file you
+                         opened: the size is said first, and the write is atomic.
+  req|request <path> [a] run curl against a path, with curl's own arguments passed
+                         through untouched and no shell between. The request is
+                         shown before it is made; curl's status is named, not
+                         printed as a number.
+  continue [flags]       scan further with the scan's own arguments. NOT a resume:
+                         no frontier is stored, so a deeper run re-fetches what it
+                         already covered and goes further. The scope becomes where
+                         you are standing, and the flags you type are applied last.
 `
 
 func main() {
@@ -76,7 +143,7 @@ func main() {
 		os.Exit(2)
 	}
 	switch verb := os.Args[1]; verb {
-	case "read", "info", "json":
+	case "read", "info", "json", "select":
 		if err := run(verb, os.Args[2:]); err != nil {
 			// A help request is not a failure. `webmap -h` exits 0 as well,
 			// so the reader must not answer it with an error line.
@@ -131,6 +198,13 @@ func (e unavailable) Error() string { return fmt.Sprintf("%d request(s) this fil
 // run answers one read request. The verb chooses what is printed; the flags are
 // the same for all three, because they are the scan's.
 func run(verb string, args []string) error {
+	// -i is taken out before the flag set sees the arguments, and it is not in the
+	// flag set at all. The reader's flags are the scan's flags, one for one, and
+	// that is a property the tests check; a reader-only flag belongs outside it,
+	// where it cannot be mistaken for one the scan has and where its absence from
+	// the parity list is visible rather than hidden.
+	keyPath, args := takeKeyFlag(args)
+
 	cfg, fs := newFlagSet()
 	path, err := parseRead(fs, args)
 	if err != nil {
@@ -144,20 +218,16 @@ func run(verb string, args []string) error {
 	cfg.Apply(fs)
 	depth := readDepth(cfg, fs)
 
-	f, err := wmse.Open(path)
-	if err != nil {
-		return err
-	}
-	snap, err := f.Load()
+	snap, info, err := openSnapshot(path, keyPath, verb == "select")
 	if err != nil {
 		return err
 	}
 
-	o := &options{cfg: cfg, snap: snap, file: f, path: path, depth: depth}
+	o := &options{cfg: cfg, snap: snap, info: info, path: path, depth: depth}
 	o.setup()
 	// The reasons come first and on stderr, so that they are read before the
-	// report rather than discovered at the end of it, and so that a report
-	// piped into another tool is not polluted with diagnostics.
+	// report rather than discovered at the end of it, and so that a report piped
+	// into another tool is not polluted with diagnostics.
 	o.explain()
 
 	switch verb {
@@ -165,12 +235,29 @@ func run(verb string, args []string) error {
 		return viewJSON(snap, os.Stdout)
 	case "info":
 		viewInfo(o)
+		return finish(o)
+	case "select":
+		return runSelect(o, os.Stdin, os.Stdout, keyPath)
 	default:
-		viewReport(o)
+		return report(o)
 	}
+}
+
+// report prints the scan's report over a loaded file and answers with a status.
+// It is one function because there is one report: the verb and the session's read
+// command both go through it, so a second rendering of the same sections cannot
+// drift away from the first.
+func report(o *options) error {
+	viewReport(o)
+	return finish(o)
+}
+
+// finish ends a read request: the budget's own notice about itself, and a status
+// for whatever the file could not answer.
+func finish(o *options) error {
 	// The budget reports itself whether or not anything else went wrong: a
-	// truncated report that says nothing about being truncated is the one
-	// failure a reader cannot detect from its own output.
+	// truncated report that says nothing about being truncated is the one failure
+	// a reader cannot detect from its own output.
 	if err := o.finish(); err != nil {
 		return err
 	}

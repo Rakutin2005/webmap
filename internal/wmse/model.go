@@ -47,6 +47,13 @@ const (
 	// for data that was never collected. Zero is the honest value for a scan
 	// that did not crawl, since only the entry point was fetched.
 	MetaMaxDepth = "max_depth"
+	// MetaArchiveFiles is the number of files in the sidecar archive, so a
+	// reader can say "this file kept 3 reference files" without opening it.
+	MetaArchiveFiles = "archive_files"
+	// MetaArchiveName is the source URL a .ref file was written for, kept as a
+	// per-file key prefix (archive_ref:<url>) so the reader can map a link back
+	// to its reference file by source.
+	MetaArchiveName = "archive_ref:"
 )
 
 // Stats mirrors categorizer.Stats. It is stored rather than recomputed so a
@@ -145,6 +152,24 @@ type Snapshot struct {
 	Observations []contract.Observation
 
 	Emulation *Emulation
+
+	// Archive holds the files the scan kept beside its graph, as an
+	// uncompressed tar: today the per-source .ref files, one per source
+	// document, each saying where in that document every link was found. It is
+	// opaque here - the format does not parse it - so that the file can carry
+	// file kinds the graph has no concept of, and so a reader that wants one
+	// file does not have to understand the rest.
+	Archive []byte
+	// ArchiveNames lists the entries in Archive, in the order they were
+	// written, so a reader can show what is inside without walking the tar.
+	ArchiveNames []string
+
+	// Signature is what the file says about itself: who signed it, with what, and
+	// the signature. It is nil for a file that was not signed, and that is not the
+	// same thing as a file whose signature does not verify - a reader has to be able
+	// to tell "this claims nothing" from "this is broken", because the second is an
+	// accusation and the first is not.
+	Signature *Signature
 }
 
 // LinkKey is the identity of a link node: the absolute URL when it is known,
