@@ -82,7 +82,9 @@ func TestEditorEditsTheLine(t *testing.T) {
 func TestEditorDrawsTheLineAndTheCursor(t *testing.T) {
 	// The cursor is moved back into the line with a carriage return and a
 	// right-move, so a line edited in the middle can be seen to be edited in the
-	// middle: two lefts into "> abc" put the cursor at column 3 of 5.
+	// middle. The distance moved is the column the cursor belongs on, counted
+	// from the start the carriage return leaves it at: into "> abc" (5 columns
+	// wide, the text starting at 3) two lefts put it at column 3.
 	_, drawn, err := edited(t, "abc\x1b[D\x1b[D\r", nil)
 	if err != nil {
 		t.Fatalf("read: %v", err)
@@ -90,8 +92,35 @@ func TestEditorDrawsTheLineAndTheCursor(t *testing.T) {
 	if !strings.Contains(drawn, "> abc") {
 		t.Errorf("the drawn line does not carry the prompt and the text: %q", drawn)
 	}
-	if !strings.Contains(drawn, "\r\x1b[2C") {
+	if !strings.Contains(drawn, "\r\x1b[3C") {
 		t.Errorf("the cursor was not moved back into the line: %q", drawn)
+	}
+	// Each left is one column further left, and Home is the start of the text
+	// rather than the start of the prompt. Moving by the distance back to the end
+	// of the line instead landed the cursor inside the prompt, which is what
+	// made the arrow keys look like they jumped to the beginning.
+	for _, c := range []struct {
+		name, keys, want string
+	}{
+		{"one left", "abc\x1b[D\r", "\r\x1b[4C"},
+		{"two lefts", "abc\x1b[D\x1b[D\r", "\r\x1b[3C"},
+		{"three lefts", "abc\x1b[D\x1b[D\x1b[D\r", "\r\x1b[2C"},
+		{"home", "abc\x1b[H\r", "\r\x1b[2C"},
+		{"ctrl-a", "abc\x01\r", "\r\x1b[2C"},
+	} {
+		_, drawn, err := edited(t, c.keys, nil)
+		if err != nil {
+			t.Fatalf("%s: read: %v", c.name, err)
+		}
+		if !strings.Contains(drawn, c.want) {
+			t.Errorf("%s: the cursor did not land on its column, want %q in %q", c.name, c.want, drawn)
+		}
+	}
+	// Back to the end of the line: no move at all, because a carriage return
+	// there would drop the cursor at the start of it.
+	_, drawn, _ = edited(t, "abc\x1b[D\x1b[D\x1b[F\r", nil)
+	if strings.Contains(drawn, "\r\r\n") {
+		t.Errorf("the cursor was sent to the start of the line on End: %q", drawn)
 	}
 	// A cursor at the end of the line must not be moved at all: a carriage
 	// return there would drop it at the start of the line.

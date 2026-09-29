@@ -441,16 +441,27 @@ func (e *lineEditor) draw() {
 	e.cursorAt(len(p) + e.cur)
 }
 
-// cursorAt moves the cursor to a column of the drawn line.
+// cursorAt puts the cursor on a column of the drawn line.
+//
+// A carriage return takes it to column 0, so getting from there to the column
+// wanted is a right-move of exactly that many columns. Moving by the distance
+// back to the end of the line instead lands the cursor as far short of it as it
+// is from the start, which is what sent the arrow keys into the prompt.
 func (e *lineEditor) cursorAt(col int) {
-	back := e.drawn - col
-	if back <= 0 {
+	if col < 0 {
+		col = 0
+	}
+	if col >= e.drawn {
 		// Already where it belongs. A carriage return here would put the cursor
 		// at the start of the line, which is the one place it must not be while
 		// the person is typing at the end of it.
 		return
 	}
-	fmt.Fprintf(e.out, "\r\033[%dC", back)
+	if col == 0 {
+		fmt.Fprint(e.out, "\r")
+		return
+	}
+	fmt.Fprintf(e.out, "\r\033[%dC", col)
 }
 
 // insert puts a rune in at the cursor.
