@@ -488,6 +488,16 @@ func (c *context) collectExpr(e expr) {
 		for _, p := range e.props {
 			c.collectExpr(p.value)
 		}
+	case *memberExpr:
+		// A call behind a property is still a call, and this pass has to reach
+		// it for the same reason the main analysis does.
+		c.collectExpr(e.object)
+		if call, ok := e.object.(*callExpr); ok {
+			c.collectExpr(call.callee)
+			for _, a := range call.args {
+				c.collectExpr(a)
+			}
+		}
 	case *newExpr:
 		if id, ok := e.callee.(*identExpr); ok {
 			// A builder constructor tells the pass that a query builder is
@@ -496,6 +506,15 @@ func (c *context) collectExpr(e expr) {
 			_ = id
 		}
 	case *callExpr:
+		// A receiver that writes is a client, not a router.
+		if me, ok := e.callee.(*memberExpr); ok {
+			switch me.property {
+			case "post", "put", "patch", "delete":
+				if id, ok := me.object.(*identExpr); ok {
+					c.writerRcv[id.name] = true
+				}
+			}
+		}
 		// "p.append('sort', ...)" inside a method: the name belongs to that
 		// method. The token pass cannot tell two methods apart when they both
 		// use a variable called p, and on a real site they do - one builds the
@@ -1141,6 +1160,31 @@ func (c *context) harvestTokens(tokens []token) {
 	}
 }
 
+// coveredByKnownLink reports whether a literal is only the head of an address
+// the analysis has already read in full. "/documents/" is a fragment of
+// "/documents/{e}/cancel/", and reporting both says the same thing twice while
+// standing in for two different endpoints. A literal that is *not* a fragment -
+// the whole of "/bitrix/tools/ajax_redirector.php?hash=", which no analysis
+// resolved - is kept, since dropping it would lose an endpoint outright.
+func (c *context) coveredByKnownLink(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, l := range c.links {
+		for _, cand := range []string{l.HREF, l.Resolved} {
+			// Only a template counts as the fuller address: it names the variable
+			// the head left out. Another plain prefix is just as much a fragment
+			// as this one, and dropping the head because of it would lose the
+			// endpoint - which is what happened to Bitrix's ajax_redirector,
+			// whose only mention is "/bitrix/tools/ajax_redirector.php?hash=" + i.
+			if len(cand) > len(s) && strings.Contains(cand, "{") && strings.HasPrefix(cand, s) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (c *context) harvestString(s string, traced []string) {
 	s = strings.TrimSpace(s)
 	if !looksLikeAPIEndpoint(s) {
@@ -1232,6 +1276,15 @@ func (c *context) scanRequestSites(tokens []token) {
 		}
 		if t.typ != tokString || len(stack) == 0 {
 			continue
+		}
+		// A literal at the head of a concatenation is usually a fragment of a
+		// longer address, and the analysis has often already read that address
+		// in full. Reporting the fragment as well would stand in for a second
+		// endpoint that nothing requested.
+		if i+1 < len(tokens) && tokens[i+1].typ == tokOp && tokens[i+1].value == "+" {
+			if head, _ := tokenStringRun(tokens, i); c.coveredByKnownLink(head) {
+				continue
+			}
 		}
 		// Attribute the literal to the nearest enclosing call, skipping any
 		// argument object it sits in: f("/x") and f({url: "/x"}) both count.
@@ -1646,6 +1699,15 @@ func (c *context) scanCalls(tokens []token, jsContent string) {
 		if j >= len(tokens) {
 			continue
 		}
+		// The address is the whole first argument, not the literal at the front
+		// of it: "/api/x/" + id is one address with a variable in it. When that
+		// address is already known in full the head adds nothing; when it is
+		// not, the head is all there is and is kept.
+		if j+1 < len(tokens) && tokens[j+1].typ == tokOp && tokens[j+1].value == "+" {
+			if head := c.tokenArgURL(tokens[j]); c.coveredByKnownLink(head) {
+				continue
+			}
+		}
 		url := c.tokenArgURL(tokens[j])
 		if !urlArgShape(url) {
 			continue
@@ -1811,6 +1873,10 @@ type context struct {
 	// ("var q = p.toString()"), which is how a builder usually reaches the
 	// address bar or a request URL.
 	builderAlias map[string]string
+	// writerRcv holds the receivers that issue a request other than GET in this
+	// file. A ".get" on one of them is a request even when its path carries no
+	// API signal, because routers do not also send POSTs.
+	writerRcv map[string]bool
 	// paramCount maps a name/kind/owner key to its index in paramRefs and
 	// folds repeated occurrences of the same name into one record.
 	paramCount map[string]int
@@ -1868,6 +1934,7 @@ func newContext(sourceURL string, fullInfo bool) *context {
 		scopeKind:           map[string]linker.ParamKind{},
 		builderScope:        map[string]string{},
 		builderAlias:        map[string]string{},
+		writerRcv:           map[string]bool{},
 		varScope:            map[string]string{},
 		props:               map[string]map[string]string{},
 		varInits:            map[string]expr{},
@@ -2242,6 +2309,21 @@ func (c *context) headersExpr(e expr) []contract.NameValue {
 // value. Dynamic values (idents, calls, member lookups) resolve through the
 // tracked var/string table; anything unresolvable fails so callers can fall
 // back to a literal.
+// conditionalValue reads a "cond ? a : b" for the one branch that is a value
+// worth reporting. A body argument is usually one of them.
+func (c *context) conditionalValue(e *binaryExpr) (any, bool) {
+	branches, ok := e.right.(*binaryExpr)
+	if !ok || branches.op != ":" {
+		return nil, false
+	}
+	for _, b := range []expr{branches.left, branches.right} {
+		if v, ok := c.objValue(b); ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
 func (c *context) objValue(e expr) (any, bool) {
 	switch e := e.(type) {
 	case *stringExpr:
@@ -2285,6 +2367,14 @@ func (c *context) objValue(e expr) (any, bool) {
 			if lk && rk {
 				return fmt.Sprint(l) + fmt.Sprint(r), true
 			}
+		}
+		if e.op == "?" {
+			// "cond ? {reason: t} : {}" is how a minified bundle writes an
+			// optional body, and it is the only place the body appears. The
+			// branch that carries an object wins; when both do, the one that is
+			// taken first is the one to report, since that is what a request
+			// without the condition sends.
+			return c.conditionalValue(e)
 		}
 	case *templateExpr:
 		var b strings.Builder
@@ -2599,6 +2689,21 @@ func (c *context) analyzeExpr(e expr) {
 		}
 	case *classExpr:
 		c.analyzeClass(e)
+	case *memberExpr:
+		// A call behind a property is still a call: "(await api.get(u)).data",
+		// "u.then(r => ...)", "r.json()". Without this a member expression is
+		// opaque and the request under it is never seen - which is how a whole
+		// api module written in that style loses every endpoint it declares.
+		c.analyzeExpr(e.object)
+		if call, ok := e.object.(*callExpr); ok {
+			// A chain callback receives the response, so its body is where the
+			// shape of that response is written down.
+			if me, ok := call.callee.(*memberExpr); ok && responseChains[me.property] {
+				for _, a := range call.args {
+					c.analyzeExpr(a)
+				}
+			}
+		}
 	case *objectExpr:
 		c.analyzeConfigObj(e)
 		c.analyzeObjectMethods(e)
@@ -3964,12 +4069,68 @@ func (c *context) placeholder(e expr) string {
 	return ""
 }
 
+// templateJoin builds a path out of a concatenation, naming the parts that are
+// not literals: "/documents/" + e + "/cancel/" gives "/documents/{e}/cancel/".
+//
+// It is deliberately narrow. A member expression is not a path parameter but an
+// opaque base - "this.ajaxUrl" says where to go without saying it - and naming
+// it would turn a request whose address is known elsewhere into a link to
+// "{this.ajaxUrl}?{params}". So a named part has to be a bare variable, one of
+// the sides has to be a literal, and the result has to look like a path.
+func (c *context) templateJoin(e expr) string {
+	b, ok := e.(*binaryExpr)
+	if !ok || b.op != "+" {
+		return ""
+	}
+	left, right := c.templatePart(b.left), c.templatePart(b.right)
+	if left == "" || right == "" {
+		return ""
+	}
+	if c.evalExpr(b.left) == "" && c.evalExpr(b.right) == "" {
+		return ""
+	}
+	joined := left + right
+	if !strings.HasPrefix(joined, "/") && !strings.Contains(joined, "://") {
+		return ""
+	}
+	return joined
+}
+
+// templatePart is one side of a concatenation: its value when it has one, and
+// its name when it is a variable standing in for a path segment.
+func (c *context) templatePart(e expr) string {
+	// A nested concatenation is assembled first, so the left half of
+	// "a + id + b" keeps its variable instead of collapsing to "a".
+	if b, ok := e.(*binaryExpr); ok && b.op == "+" {
+		if s := c.templateJoin(b); s != "" {
+			return s
+		}
+	}
+	if s := c.evalExpr(e); s != "" {
+		return s
+	}
+	switch e.(type) {
+	case *identExpr, *interpExpr:
+		return c.placeholder(e)
+	}
+	return ""
+}
+
 // resolveURLArg returns the best-effort literal for an endpoint argument.
 // Fully-resolvable expressions evaluate normally; otherwise static fragments
 // are kept and unresolvable interpolations become "{var}" placeholders
 // (e.g. "/api/admin/recorders/{n}/sync"). Unknown stand-alone idents yield ""
 // so opaque bases like this.ajaxUrl never surface as junk links.
 func (c *context) resolveURLArg(e expr) string {
+	// A concatenation is assembled part by part before it is evaluated as a
+	// whole. Evaluating "/documents/" + e on its own yields "/documents/", which
+	// is what two different routes under /documents/ then collide on; naming the
+	// part keeps them apart as "/documents/{e}/cancel/".
+	if b, ok := e.(*binaryExpr); ok && b.op == "+" {
+		if s := c.templateJoin(b); s != "" {
+			return trimURLJoin(s)
+		}
+	}
 	if s := c.evalExpr(e); s != "" {
 		return trimURLJoin(s)
 	}
@@ -4014,6 +4175,13 @@ func (c *context) resolveURLArg(e expr) string {
 				right := c.resolveURLArg(e.right)
 				if right != "" {
 					return left + right
+				}
+				// A static prefix with a dynamic tail: the tail is a path
+				// parameter, and naming it is the difference between an endpoint
+				// that can be looked up ("/documents/{e}/cancel/") and a truncated
+				// one ("/documents/") that two different routes collide on.
+				if ph := c.placeholder(e.right); ph != "" {
+					return left + ph
 				}
 				// static prefix + dynamic tail: keep the prefix
 				return left
@@ -4943,21 +5111,19 @@ func (p *parser) parseExpr(minPrec int) expr {
 			}
 			left = &newExpr{callee: callee, args: args}
 		case "async":
-			p.advance()
-			if p.peek().typ == tokPunct && p.peek().value == "(" && p.isArrowAhead() {
-				params := p.consumeArrowHeader()
-				left = p.parseArrowBody(params)
-			} else if p.peek().typ == tokIdent {
+			// "async (e) => api.post(url)" is a function. Read as the identifier
+			// "async" called with arguments it becomes a call whose arguments
+			// are the parameters, and every request in the body then belongs to
+			// nothing. Minified bundles are written almost entirely in this
+			// form, so this is the difference between reading a component and
+			// reading a fragment of one.
+			arrow := p.tryArrow()
+			if arrow == nil {
 				p.advance()
-				if p.peek().typ == tokOp && p.peek().value == "=>" {
-					p.advance()
-					left = p.parseArrowBody([]string{t.value})
-				} else {
-					left = &identExpr{name: t.value}
-				}
-			} else {
 				left = &identExpr{name: t.value}
+				break
 			}
+			left = arrow
 		case "true":
 			p.advance()
 			left = &boolExpr{value: true}
@@ -5066,6 +5232,28 @@ func (p *parser) parseExpr(minPrec int) expr {
 						switch p.peek().value {
 						case "async", "get", "set", "static", "asyncget", "asyncset":
 							p.advance()
+							// "async (e) => fetch(...)" is an arrow with no
+							// name at all, so there is no key to read: the
+							// whole thing is the value. Minified bundles are
+							// written almost entirely in this form, and read
+							// as a key it turns the arrow into a call and
+							// everything after it into further properties.
+							if p.peek().typ == tokPunct && p.peek().value == "(" {
+								open := p.pos
+								p.advance()
+								if p.isArrowAhead() {
+									params := p.consumeArrowHeader()
+									props = append(props, property{key: "", value: p.parseArrowBody(params)})
+									if p.peek().typ == tokPunct && p.peek().value == "," {
+										p.advance()
+									}
+									if p.peek().typ == tokPunct && p.peek().value == "}" {
+										break
+									}
+									continue
+								}
+								p.pos = open
+							}
 							switch p.peek().typ {
 							case tokString, tokIdent, tokNumber, tokKeyword:
 								key = p.peek().value
@@ -5209,6 +5397,30 @@ func (p *parser) parseExpr(minPrec int) expr {
 // isArrowAhead reports whether the current position holds the start of an
 // arrow-function parameter list "(…)" whose matching ")" is directly followed
 // by "=>". It only scans tokens and never advances the parser.
+// tryArrow reads "async (…) => body" or "async name => body" and returns the
+// function, or nil when what follows the keyword is not an arrow. The position
+// is left where it was in that case, so the keyword can still be read as the
+// identifier it is when it is one.
+func (p *parser) tryArrow() expr {
+	save := p.pos
+	p.advance() // "async"
+	if p.peek().typ == tokIdent && p.pos+1 < len(p.tokens) &&
+		p.tokens[p.pos+1].typ == tokOp && p.tokens[p.pos+1].value == "=>" {
+		name := p.peek().value
+		p.advance() // the single parameter
+		p.advance() // "=>"
+		return p.parseArrowBody([]string{name})
+	}
+	if p.peek().typ == tokPunct && p.peek().value == "(" {
+		p.advance()
+		if p.isArrowAhead() {
+			return p.parseArrowBody(p.consumeArrowHeader())
+		}
+	}
+	p.pos = save
+	return nil
+}
+
 func (p *parser) isArrowAhead() bool {
 	depth := 1
 	for i := p.pos; i < len(p.tokens); i++ {
@@ -6022,7 +6234,8 @@ func (c *context) applyMatch(match callMatch, args []expr, objName, methodName, 
 			// Routers and non-HTTP libs also expose .get('/path'); for GET
 			// calls require an explicit API signal so page routes do not
 			// masquerade as endpoints. Other verbs are call-specific enough.
-			if strings.EqualFold(methodName, "get") && !apiEndpointShape(url) {
+			if strings.EqualFold(methodName, "get") && !apiEndpointShape(url) &&
+				!c.writerRcv[receiverOf(objName)] {
 				break
 			}
 		}

@@ -345,3 +345,57 @@ var app = {
 		}
 	}
 }
+
+// A modern api module is written as a map of anonymous async arrows that return
+// "(await client.post(...)).data". Three things in that shape used to hide the
+// request: the async arrow was read as the identifier "async" called with the
+// parameters, a call behind ".data" was never descended into, and a body behind
+// a conditional was not read. The endpoint existed only as a truncated prefix.
+func TestAsyncArrowModule(t *testing.T) {
+	js := `
+import{e as s}from"./chunk.js";
+var api={
+  cancel:async(e,t)=>(await s.post("/documents/"+e+"/cancel/",t?{reason:t}:{})).data,
+  markTest:async e=>(await s.post("/documents/"+e+"/mark-test/",{})).data,
+  get:async e=>(await s.get("/documents/"+e+"/")).data
+};
+`
+	_, obs, _ := ParseWithParams(js, "https://signx.kz/", true)
+	type seen struct{ method, path, body string }
+	got := map[string]seen{}
+	for _, o := range obs {
+		got[o.URL] = seen{o.Method, o.URL, o.Body}
+	}
+	for _, want := range []struct{ path, method, body string }{
+		{"https://signx.kz/documents/{e}/cancel/", "POST", `{"reason":null}`},
+		{"https://signx.kz/documents/{e}/mark-test/", "POST", `{}`},
+		{"https://signx.kz/documents/{e}/", "GET", ""},
+	} {
+		s, ok := got[want.path]
+		if !ok {
+			t.Errorf("no observation for %s, got %v", want.path, got)
+			continue
+		}
+		if s.method != want.method {
+			t.Errorf("%s: method %s, want %s", want.path, s.method, want.method)
+		}
+		if want.body != "" && s.body != want.body {
+			t.Errorf("%s: body %q, want %q", want.path, s.body, want.body)
+		}
+	}
+}
+
+// A literal that is one piece of a longer address is not an address of its own.
+// Reporting the head of a concatenation invents a path nothing ever requested,
+// and leaves it sitting beside the real endpoint that contains it.
+func TestConcatenatedLiteralIsNotItsOwnEndpoint(t *testing.T) {
+	links, _, _ := ParseWithParams(
+		`e.post('/api/user/archive/requests/' + userId, {id: 7})`,
+		"https://example.com", true)
+	if len(links) != 1 {
+		t.Fatalf("expected one endpoint, got %d: %+v", len(links), links)
+	}
+	if !strings.Contains(links[0].HREF, "{userId}") {
+		t.Errorf("the endpoint does not name the variable: %q", links[0].HREF)
+	}
+}

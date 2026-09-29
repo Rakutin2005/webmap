@@ -279,6 +279,32 @@ func (s *session) rowFor(l *linker.Link) string {
 
 // ---------- what ----------
 
+// resourceKind is what the resource is: a web page, a stylesheet, a font, a
+// script, an API. A contract makes it an API, because that is a statement about
+// the resource; a link category is how the scan happened to meet it.
+func resourceKind(l linker.Link, ep *contract.Endpoint) string {
+	switch {
+	case ep != nil:
+		return "API"
+	case l.Category == linker.CategoryAPI:
+		return "API"
+	case l.Category == linker.CategoryWebAsset:
+		return "asset: " + color.AssetLabel(color.ClassifyAsset(l.HREF))
+	case l.Category == linker.CategoryDynamic:
+		return "unknown"
+	}
+	return l.Category.String()
+}
+
+// discoveryNote says what a category of link means, for the line that reports
+// how the resource was found.
+func discoveryNote(c linker.Category) string {
+	if c == linker.CategoryDynamic {
+		return "a URL assembled in code, not read off a page"
+	}
+	return ""
+}
+
 // cmdWhat identifies a resource: what kind of thing it is, how it was
 // classified, and where it was seen. It is the "I have a URL, what is it?"
 // question, which the link table answers only if you already know to look.
@@ -293,10 +319,19 @@ func (s *session) cmdWhat(args []string) {
 		s.notFound(full)
 		return
 	}
+	ep := s.contractFor(full)
 	fmt.Fprintf(s.out, "\n  %s\n", s.bold(s.field(full)))
-	fmt.Fprintf(s.out, "    kind      %s\n", l.Category.String())
-	if l.Category == linker.CategoryWebAsset {
-		fmt.Fprintf(s.out, "    asset     %s\n", color.AssetLabel(color.ClassifyAsset(l.HREF)))
+	// The type of the resource, and how it came by. Those are two different
+	// facts: DYNAMIC says the URL was assembled in code rather than read off a
+	// page, which is not a kind of thing to be - a stylesheet is a stylesheet
+	// however it was found, and a route that answers JSON is an API whether the
+	// crawl saw a link to it or the analyzer read it out of a bundle.
+	kind := resourceKind(l, ep)
+	fmt.Fprintf(s.out, "    kind      %s\n", kind)
+	if l.Category == linker.CategoryDynamic {
+		// Worth saying only here: for every other category the kind already is
+		// the category, and a second line repeating it is noise.
+		fmt.Fprintf(s.out, "    %s\n", s.dim("found as    DYNAMIC ("+discoveryNote(l.Category)+")"))
 	}
 	if l.Class != linker.ClassNormal {
 		fmt.Fprintf(s.out, "    class     %s\n", l.Class.String())
@@ -321,10 +356,20 @@ func (s *session) cmdWhat(args []string) {
 	}
 	// The contract and the references are the two things that make a resource
 	// interesting, so name them even though the commands below print them.
-	if ep := s.contractFor(full); ep != nil {
+	if ep != nil {
+		// The contract is what makes this an endpoint, so it is printed here
+		// rather than left behind another command: a person who asked what a
+		// path is wants the answer, not a pointer to where the answer is.
+		fmt.Fprintln(s.out)
+		renderEndpoint(s, ep)
+		if obs := s.observationsFor(full); len(obs) > 0 {
+			fmt.Fprintf(s.out, "  %s\n", s.dim(plural(len(obs), "captured request")))
+		} else {
+			fmt.Fprintf(s.out, "  %s\n", s.dim("no request captured: the contract is inference only"))
+		}
 		// The contract's own path, not the link's: it is the readable shape, and
 		// it is what a person would type back.
-		fmt.Fprintf(s.out, "    %s\n", s.dim("has a contract: try `api "+s.field(ep.Path)+"`"))
+		fmt.Fprintf(s.out, "  %s\n", s.dim("describe it with `api "+s.field(ep.Path)+"`"))
 	}
 	if parents := s.parentsOf(full); len(parents) > 0 {
 		fmt.Fprintf(s.out, "    %s\n", s.dim(fmt.Sprintf("referenced by %d page(s): try `from %s`", len(parents), s.field(full))))
