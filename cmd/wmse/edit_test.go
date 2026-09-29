@@ -48,6 +48,7 @@ func TestEditorEditsTheLine(t *testing.T) {
 		del   = "\x1b[3~"
 		cr    = "\r"
 		bs    = "\x7f"
+		up    = "\x1b[A"
 		ctrlU = "\x15"
 		ctrlK = "\x0b"
 		ctrlW = "\x17"
@@ -335,5 +336,67 @@ func TestHistoryOnAnEmptyList(t *testing.T) {
 	h := &history{limit: historyLimit}
 	if _, ok := h.step(-1, "x"); ok {
 		t.Errorf("an empty history should not step")
+	}
+}
+
+// Deleting text before the caret has to take the caret with it. When it did not,
+// the caret stayed at the column the text used to reach, and the next keypress
+// indexed past the end of the line: two backspaces in a row, or a Ctrl-U
+// followed by typing, took the whole session down with a slice out of range.
+//
+// The text of the line was right in every one of those cases, which is why the
+// tests above did not see it: they read the result and the result was correct.
+// What is wrong is the position, so these read the drawn cursor.
+func TestEditorCaretFollowsDeletionsBeforeIt(t *testing.T) {
+	const (
+		left  = "\x1b[D"
+		right = "\x1b[C"
+		up    = "\x1b[A"
+		cr    = "\r"
+		bs    = "\x7f"
+		ctrlU = "\x15"
+		ctrlW = "\x17"
+	)
+	for _, c := range []struct{ name, keys, want string }{
+		// Two backspaces in a row: the second one has to work.
+		{"backspace twice", "hello" + bs + bs + "x" + cr, "helx"},
+		// Backspace at the start of a line is nothing, not a crash.
+		{"backspace at the start", bs + bs + "ls" + cr, "ls"},
+		// A deletion made with the caret in the middle, then typed at.
+		{"backspace in the middle", "abc" + left + bs + "X" + cr, "aXc"},
+		{"ctrl-u then typing", "ls -junk" + ctrlU + "info" + cr, "info"},
+		{"ctrl-w then typing", "cd /a junk" + ctrlW + "ls" + cr, "cd /a ls"},
+		// Delete forward takes the character at the caret, which is the one
+		// after it, and leaves the caret where it was.
+		{"delete then type", "abc" + left + "\x1b[3~" + "X" + cr, "abX"},
+		{"delete at the end does nothing", "abc" + "\x1b[3~" + "X" + cr, "abcX"},
+	} {
+		if got := line(t, c.keys); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+	// The caret is where the text says it is. In "ab" the caret is after the b;
+	// one left puts it between them, and backspace there takes the a and leaves
+	// the caret in front of the b, so the next letter lands before it.
+	if got := line(t, "ab"+left+bs+"Z"+cr); got != "Zb" {
+		t.Errorf("backspace in the middle left %q, want %q", got, "Zb")
+	}
+	// The right arrow still moves after a deletion, which it did not while the
+	// caret was left past the end of the line: it is bounded by the length of
+	// the line, so a caret beyond it silently refused to move at all.
+	if got := line(t, "abc"+left+left+bs+right+"Z"+cr); got != "bZc" {
+		t.Errorf("right arrow after a backspace gave %q, want %q", got, "bZc")
+	}
+	// A recalled line is edited like any other: recall replaces the whole line,
+	// and the backspace that follows has to land on what recall brought back.
+	got, _, err := edited(t, "info"+cr+"info"+cr+up+"xx"+bs+bs+cr, func(e *lineEditor) {
+		e.hist = &history{limit: 10}
+		e.hist.remember("info")
+	})
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("editing: %v", err)
+	}
+	if got != "info" {
+		t.Errorf("a recalled line edited by backspace gave %q, want %q", got, "info")
 	}
 }

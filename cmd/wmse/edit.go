@@ -337,6 +337,15 @@ func (e *lineEditor) read() (string, error) {
 		if err != nil || done {
 			return string(e.buf), err
 		}
+		// The caret is an index into the line, and every edit is supposed to
+		// leave it pointing at a rune. A last check costs one comparison and
+		// turns an editor slip into a caret that moved, instead of a panic that
+		// takes the session - and the place the person had walked to - with it.
+		if e.cur > len(e.buf) {
+			e.cur = len(e.buf)
+		} else if e.cur < 0 {
+			e.cur = 0
+		}
 	}
 }
 
@@ -367,7 +376,12 @@ func (e *lineEditor) act(k key) (bool, error) {
 		e.cur = 0
 	case keyBackspace:
 		if e.cur > 0 {
-			e.remove(e.cur-1, e.cur)
+			// The caret is a position in the text, so deleting the character
+			// before it moves the caret left along with it. Leaving it put
+			// would leave it past the end of the line, and the next keypress
+			// would then slice out of range.
+			e.cur--
+			e.remove(e.cur, e.cur+1)
 		}
 	case keyDelete:
 		e.deleteForward()
@@ -387,6 +401,7 @@ func (e *lineEditor) act(k key) (bool, error) {
 		// Clear from the start of the line to the cursor, which is the one edit
 		// worth a key: it discards a whole mistyped command in one press.
 		e.remove(0, e.cur)
+		e.cur = 0
 	case keyCtrlK:
 		e.remove(e.cur, len(e.buf))
 	case keyCtrlW:
@@ -446,8 +461,9 @@ func (e *lineEditor) insert(r rune) {
 	e.cur++
 }
 
-// remove deletes a half-open range, keeping the cursor where it is so that
-// deleting backwards does not also move the caret.
+// remove deletes a half-open range. The caller owns the cursor: whether the
+// caret moves depends on which side of it the text was taken from, and only the
+// caller knows that.
 func (e *lineEditor) remove(from, to int) {
 	e.buf = append(e.buf[:from], e.buf[to:]...)
 }
@@ -469,6 +485,7 @@ func (e *lineEditor) killWord() {
 		i--
 	}
 	e.remove(i, e.cur)
+	e.cur = i
 }
 
 // recall walks the history.
