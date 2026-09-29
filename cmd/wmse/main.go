@@ -94,7 +94,7 @@ page or in a directory, and which one it is decides what ls answers:
   ls -d [path]     ask for a path as a directory, whatever page answers for it
   what <path>      what a path is: kind, class, where it was seen
   from <path>      the pages that reference a resource
-  api [path]       an endpoint's contract, or why there is none
+  api [path]       every contract, or one endpoint's contract and why there is none
   find <kind> <g>  search by kind and glob
   read [flags]     the scan's whole report, with the reader's flags
   refs [path]      where links were found, from the .ref sidecar

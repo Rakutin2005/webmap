@@ -187,7 +187,7 @@ func (s *session) banner() {
 		fmt.Fprintf(s.out, "  archive   %s\n", archiveBrief(f.snap.ArchiveNames))
 	}
 	fmt.Fprintf(s.out, "\n  %s\n", s.dim("cd [path] move · ls list here · ls -d list as a directory · what <path> identify it"))
-	fmt.Fprintf(s.out, "  %s\n", s.dim("from <path> who references it · find <kind> <glob> search · api [path] describe · history · help quit"))
+	fmt.Fprintf(s.out, "  %s\n", s.dim("from <path> who references it · find <kind> <glob> search · api list contracts · history · help quit"))
 	fmt.Fprintf(s.out, "  %s\n", s.dim("Tab completes, the arrows walk the line and the history, Ctrl-C abandons a line"))
 }
 
@@ -420,7 +420,7 @@ func (s *session) help() {
 		{"encrypt <how> <key>", "encrypt this file: password, rsa or aes"},
 		{"what <path>", "identify what a path is: kind, class, and where it was seen"},
 		{"from <path>", "list the pages that reference a resource"},
-		{"api [path]", "describe an API endpoint: its contract, or why there is none"},
+		{"api [path]", "list the contracts, or describe one endpoint and why there is none"},
 		{"find <kind> <glob>", "search by kind (api, js, css, image, html, any) and glob"},
 		{"refs [path]", "show where links were found, from the .ref sidecar"},
 		{"info", "the file header: target, scope, command, what it holds"},
@@ -535,6 +535,12 @@ func (s *session) knownPaths() []string {
 			continue
 		}
 		add(wmse.LinkKey(&s.merged.Links[i]))
+	}
+	// A contract is a place a person can stand: it names a resource the file
+	// describes, and `api <Tab>` is how one is asked about. Leaving them out
+	// made the paths the report prints unnameable at the prompt.
+	for i := range s.merged.Endpoints {
+		add(s.merged.Endpoints[i].Path)
 	}
 	sort.Strings(out)
 	s.paths = out
@@ -799,8 +805,13 @@ func (s *session) nodeFor(full string) (linker.Link, bool) {
 	if l, ok := s.bestNode(func(key string) bool { return key == full }); ok {
 		return l, true
 	}
-	byPath := pathOnly(full)
-	return s.bestNode(func(key string) bool { return pathOnly(key) == byPath })
+	// The place key, not the raw path: a link keeps the percent-encoding the
+	// fetch resolved it to, so a template route is stored as
+	// /cabinet/documents/%7Bt%7D/sign/ and named in every report and every
+	// conversation as /cabinet/documents/{t}/sign. A person pastes the second
+	// and expects to be answered about the first.
+	byPlace := placeKey(full)
+	return s.bestNode(func(key string) bool { return placeKey(key) == byPlace })
 }
 
 // bestNode returns the best link whose key satisfies a predicate, preferring a

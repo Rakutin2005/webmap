@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"path"
 	"sort"
 	"strings"
@@ -46,6 +47,35 @@ func pathOnly(u string) string {
 	p := pathOf(u)
 	if i := strings.IndexAny(p, "?#"); i >= 0 {
 		p = p[:i]
+	}
+	if p == "" {
+		return "/"
+	}
+	return p
+}
+
+// placeKey is what two URLs are compared by: the path, decoded, without a
+// trailing slash.
+//
+// The same URL is written two ways in a file and both are shown to a person. A
+// link keeps the percent-encoding the fetch resolved it to, so a template route
+// arrives as /cabinet/documents/%7Bt%7D/sign/, while a contract keeps the
+// readable shape, /cabinet/documents/{t}/sign/, because that is what the report
+// prints. Asking for one of them used to find neither: the two are the same
+// place, and a person pasting a path out of the report is not going to encode
+// the braces for us.
+//
+// The trailing slash goes because the report prints an endpoint the way the scan
+// inferred it and the link the way the crawl reached it, and those two differ on
+// the slash far more often than they differ in anything that matters. A path
+// that is only a slash stays a slash.
+func placeKey(u string) string {
+	p := pathOnly(u)
+	if decoded, err := url.PathUnescape(p); err == nil {
+		p = decoded
+	}
+	for len(p) > 1 && strings.HasSuffix(p, "/") {
+		p = strings.TrimSuffix(p, "/")
 	}
 	if p == "" {
 		return "/"
@@ -291,8 +321,10 @@ func (s *session) cmdWhat(args []string) {
 	}
 	// The contract and the references are the two things that make a resource
 	// interesting, so name them even though the commands below print them.
-	if s.contractFor(full) != nil {
-		fmt.Fprintf(s.out, "    %s\n", s.dim("has a contract: try `api "+s.field(full)+"`"))
+	if ep := s.contractFor(full); ep != nil {
+		// The contract's own path, not the link's: it is the readable shape, and
+		// it is what a person would type back.
+		fmt.Fprintf(s.out, "    %s\n", s.dim("has a contract: try `api "+s.field(ep.Path)+"`"))
 	}
 	if parents := s.parentsOf(full); len(parents) > 0 {
 		fmt.Fprintf(s.out, "    %s\n", s.dim(fmt.Sprintf("referenced by %d page(s): try `from %s`", len(parents), s.field(full))))
@@ -328,7 +360,7 @@ func (s *session) ensurePageIndex() pageIndex {
 // reading one of them learns something.
 func (s *session) cmdAPI(args []string) {
 	if len(args) == 0 || args[0] == "" {
-		s.usage("api [path]")
+		s.listContracts()
 		return
 	}
 	full := s.resolve(args[0])
@@ -361,6 +393,42 @@ func (s *session) cmdAPI(args []string) {
 			fmt.Fprintf(s.out, "    %s %s\n", ob.Method, ob.URL)
 		}
 	}
+}
+
+// listContracts prints every contract the file holds, one per line, the way `ls`
+// with no argument lists the place it is standing in. An empty argument asking
+// for the whole set is the natural reading, and the answer used to be a usage
+// line: the one command that knows where the endpoints are could not be asked
+// for them.
+func (s *session) listContracts() {
+	if len(s.merged.Endpoints) == 0 {
+		fmt.Fprintf(s.out, "  %s\n", s.dim("no contract in this file"))
+		return
+	}
+	fmt.Fprintf(s.out, "\n  %s\n\n", s.dim(plural(len(s.merged.Endpoints), "contract")))
+	order := make([]int, len(s.merged.Endpoints))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool {
+		return s.merged.Endpoints[order[a]].Path < s.merged.Endpoints[order[b]].Path
+	})
+	for _, i := range order {
+		ep := &s.merged.Endpoints[i]
+		methods := strings.Join(ep.Methods, ", ")
+		if methods == "" {
+			methods = "ANY"
+		}
+		if ep.MethodInferred {
+			methods += " (inferred)"
+		}
+		note := ""
+		if ep.Unobserved {
+			note = "  " + s.dim("path only")
+		}
+		fmt.Fprintf(s.out, "  %-52s %s%s\n", s.field(ep.Path), methods, note)
+	}
+	fmt.Fprintf(s.out, "\n  %s\n", s.dim("api <path> describes one of them"))
 }
 
 // renderEndpoint prints a contract the way the scan's contract section does.
@@ -438,10 +506,14 @@ func (s *session) contractFor(full string) *contract.Endpoint {
 			}
 		}
 	}
-	byPath := pathOnly(full)
+	// Not every contract has an edge: a URL recovered from a bundle is a finding
+	// even when the crawl never recorded it as a link, and the two sides of the
+	// file spell such a path differently. Comparing the place key is what makes
+	// the contract reachable by the path the report printed.
+	want := placeKey(full)
 	for i := range s.merged.Endpoints {
 		ep := &s.merged.Endpoints[i]
-		if pathOnly(s.resolve(ep.Path)) == byPath {
+		if placeKey(ep.Path) == want {
 			return ep
 		}
 	}
@@ -450,9 +522,10 @@ func (s *session) contractFor(full string) *contract.Endpoint {
 
 func (s *session) observationsFor(full string) []contract.Observation {
 	var out []contract.Observation
+	want := placeKey(full)
 	for i := range s.merged.Observations {
 		ob := &s.merged.Observations[i]
-		if s.resolve(ob.URL) == full {
+		if placeKey(s.resolve(ob.URL)) == want {
 			out = append(out, *ob)
 		}
 	}
@@ -563,6 +636,23 @@ func (s *session) cmdFind(args []string) {
 			g := &s.merged.Groups[i]
 			if kindMatchesGroup(kind, g) && globMatch(glob, g.Pattern) {
 				found = append(found, g.Pattern)
+			}
+		}
+	}
+	// A contract is a finding of its own: a URL recovered from a bundle is an
+	// endpoint even when the crawl never recorded it as a link, and a file can
+	// hold contracts the report printed without a single matching link. So a
+	// search for APIs looks in the contracts too - otherwise the one thing a
+	// person is looking for is the one thing the search cannot find.
+	if kind == "api" || kind == "any" || kind == "" {
+		seen := make(map[string]bool, len(found))
+		for _, f := range found {
+			seen[f] = true
+		}
+		for i := range s.merged.Endpoints {
+			ep := &s.merged.Endpoints[i]
+			if !seen[ep.Path] && globMatch(glob, ep.Path) {
+				found = append(found, ep.Path)
 			}
 		}
 	}
