@@ -186,6 +186,7 @@ func MessageOfTheDay() string {
 		"  -bitrix      Enable Bitrix CMS patterns",
 		"  -wp          Enable WordPress patterns",
 		"  -react       Enable React SPA patterns",
+		"  -parse-text  Parse text documents (txt, json, pdf, doc/docx, ...) for links",
 		"  -full        Show all URL classes (WAF/CDN/Cache/Noise)",
 		"  -f DOMAINS   Also crawl these comma-separated domains (e.g. -f api.site.com,cdn.site.com)",
 		"  -H \"K: V\"     Send an HTTP header (curl-style, repeatable), e.g. -H \"Authorization: Bearer ...\"",

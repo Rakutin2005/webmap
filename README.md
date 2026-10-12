@@ -80,6 +80,7 @@ JS for APIs, and show full API details:
 | `-rdepth N` | Max recursive depth (default: 5) |
 | `-t` | Tag links with type (absolute/relative/web) |
 | `-j` | Analyze JS files for API endpoints |
+| `-parse-text` | Parse text documents for links: `.txt`, `.csv`, `.json`, `.xml`, `.pdf`, Word/OpenDocument (`.doc`, `.docx`, `.odt`, …) and other non-markup files. Content sniffing picks the right parser even when the extension is wrong (a `.txt` holding a PDF or code), and code found in a text file is analyzed for endpoints |
 | `-G` | Generate ASCII graph of links |
 | `-M` | Generate markdown output directory |
 | `-T N` | Max concurrent threads (default: 32) |

@@ -45,6 +45,7 @@
 | `-rdepth N` | Max recursive depth (default: 5) |
 | `-t` | Tag links with type (absolute/relative/web) |
 | `-j` | Analyze JS files for API endpoints |
+| `-parse-text` | Parse text documents for links: `.txt`, `.csv`, `.json`, `.xml`, `.pdf`, Word/OpenDocument (`.doc`, `.docx`, `.odt`, …). Content sniffing picks the parser from the bytes when the extension lies (a `.txt` holding a PDF or code), and code found in a text file is analyzed for endpoints. |
 | `-G` | Generate ASCII graph of links |
 | `-M` | Generate markdown output directory |
 | `-T N` | Max concurrent threads (default: 32) |
@@ -254,7 +255,7 @@ Rules that follow from the file being the only source of data:
   reader with no scope flag reports the same set, and `-url`/`-f`/`-a` are the way
   to ask what a differently-scoped run would have seen.
 - **Flags that only configured the crawl are accepted and ignored**: `-k`, `-cf`,
-  `-j`, `-str`, `-M`, `-T`, `-group-count`, `-H`, `-b`, `-cookie`,
+  `-j`, `-parse-text`, `-str`, `-M`, `-T`, `-group-count`, `-H`, `-b`, `-cookie`,
   `-headers-all-hosts`, `-o`, `-o-raw`, `-patterns`, `-bitrix`, `-wp`, `-react`,
   `-emu-*`. No file can be crawled or written.
 - **What the file *is* is a verb, not a flag**: `wmse info` (layout, size per

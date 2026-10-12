@@ -24,6 +24,7 @@ import (
 	"apimap/internal/markdown"
 	"apimap/internal/patterns"
 	"apimap/internal/progress"
+	"apimap/internal/textparse"
 	"apimap/internal/urlgroup"
 	"apimap/internal/wmse"
 )
@@ -532,6 +533,9 @@ func main() {
 			allLinks = append(allLinks, emuLinks...)
 			lastEmuSummary = aggregatedEmuSummary()
 		}
+		if cfg.ParseText {
+			poolDocumentLinks(&allLinks, result.Body, result.URL, result.URL, result.Headers.Get("Content-Type"), cfg, f)
+		}
 		// The single-page path has one page, and it is the entry point: depth 0
 		// with whatever the server called it, and everything it holds at depth 1.
 		recordPage(firstNonEmpty(result.URL, cfg.URL), 0, result.Headers.Get("Content-Type"), len(allLinks))
@@ -929,6 +933,25 @@ func wrapLine(s string, width int) string {
 	return b.String()
 }
 
+// poolDocumentLinks runs the document parsers over a fetched body and folds
+// their findings into the scan.
+//
+// A document contributes in two ways. Its text carries URLs, which become the
+// same kind of link an <a href> would; and if the bytes turn out to be code
+// under a text extension, the JS analyzer contributes endpoints and parameter
+// names. Both are pooled through the paths a fetched script already uses, so
+// the report shows them without a special case.
+func poolDocumentLinks(links *[]linker.Link, body, sourceURL, rawURL, contentType string, cfg *config.Config, f *fetcher.Fetcher) {
+	res := textparse.Parse(body, sourceURL, rawURL, contentType, cfg.APIFull)
+	if len(res.Kinds) == 0 {
+		return
+	}
+	enrichLinks(res.Links, f)
+	*links = append(*links, res.Links...)
+	poolObs(true, res.Observations)
+	poolFragments(res.Params, sourceURL)
+}
+
 func enrichLinks(links []linker.Link, f *fetcher.Fetcher) {
 	for i := range links {
 		if links[i].Resolved == "" {
@@ -1153,6 +1176,9 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 						emuLinks := emulatePage(result.Body, base, f)
 						links = append(links, emuLinks...)
 					}
+					if cfg.ParseText {
+						poolDocumentLinks(&links, result.Body, url, url, contentType, cfg, f)
+					}
 				}
 				// Everything found while serving this page sits one level
 				// below it, whichever analyzer found it. The static-explorer
@@ -1212,11 +1238,15 @@ func crawl(f *fetcher.Fetcher, cfg *config.Config, maxDepth int, p *progress.Pro
 			// CDN/WAF bundles routinely carry the API calls we are after. Page
 			// crawling keeps honouring the class filters.
 			crawlForJS := cfg.AnalyzeJS && link.Category == linker.CategoryWebAsset && isJSURL(link.HREF)
-			shouldCrawl := crawlForJS || link.Category == linker.CategoryWebPage
+			// A document is fetched for its text even when it is a CDN/cache
+			// asset, for the same reason a script is: the query string is not
+			// content, and a PDF behind a CDN still carries links.
+			crawlForText := cfg.ParseText && textparse.IsTextURL(link.HREF)
+			shouldCrawl := crawlForJS || crawlForText || link.Category == linker.CategoryWebPage
 			if !shouldCrawl {
 				continue
 			}
-			if isClassHidden(link.Class, cfg) && !crawlForJS {
+			if isClassHidden(link.Class, cfg) && !crawlForJS && !crawlForText {
 				continue
 			}
 			resolved := link.Resolved

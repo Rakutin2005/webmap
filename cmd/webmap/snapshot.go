@@ -278,6 +278,9 @@ func scanMeta(cfg *config.Config, path string, started time.Time) wmse.Meta {
 	if cfg.AnalyzeJS {
 		meta["analyze_js"] = "true"
 	}
+	if cfg.ParseText {
+		meta["parse_text"] = "true"
+	}
 	if cfg.APIFull {
 		meta["api_full"] = "true"
 	}

@@ -490,14 +490,11 @@ func (c *context) collectExpr(e expr) {
 		}
 	case *memberExpr:
 		// A call behind a property is still a call, and this pass has to reach
-		// it for the same reason the main analysis does.
+		// it for the same reason the main analysis does. collectExpr already
+		// descends into a callExpr's callee and arguments, so recursing into
+		// them again here would visit the whole subtree twice per nesting level
+		// and turn a method chain like a.b().c().d() into 2^n work.
 		c.collectExpr(e.object)
-		if call, ok := e.object.(*callExpr); ok {
-			c.collectExpr(call.callee)
-			for _, a := range call.args {
-				c.collectExpr(a)
-			}
-		}
 	case *newExpr:
 		if id, ok := e.callee.(*identExpr); ok {
 			// A builder constructor tells the pass that a query builder is

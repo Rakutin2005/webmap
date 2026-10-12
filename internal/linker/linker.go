@@ -384,6 +384,109 @@ func determineLinkType(href string) LinkType {
 	return LinkTypeRelative
 }
 
+// textURLRegex finds URLs written as plain text rather than as markup. It is
+// deliberately stricter than a "grab everything after http" match: a bare
+// "//foo" in a comment must not become a host, so the protocol-relative and
+// www. forms both require a dotted host. The trailing class stops at the
+// characters that end a URL in running text (quotes, angle brackets, spaces,
+// braces and backslashes), but keeps parentheses so a path such as
+// .../Foo_(bar) is captured whole; trimURLTrailing then balances them against
+// the sentence punctuation that follows the URL.
+var textURLRegex = regexp.MustCompile(`(?i)(?:https?://[a-z0-9][a-z0-9._~:/?#@!$&*+,;=%()-]*|//[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:[:/?#][a-z0-9._~:/?#@!$&*+,;=%()-]*)?|www\.[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:[:/?#][a-z0-9._~:/?#@!$&*+,;=%()-]*)?)`)
+
+// ParseTextURLs extracts the URLs that a text document carries in its content
+// instead of in attributes. A .txt file, a PDF or a Word file has no <a href>
+// for Parse to read: its links are the http(s), //host and www. strings that
+// appear as text. tag names the kind of document so the report can show where a
+// link came from.
+//
+// Positions are not recorded: the caller hands over text that a container
+// (a decompressed PDF stream, a zipped document part) decoded, so an offset
+// into it is not an offset into any fetched resource.
+func ParseTextURLs(text, sourceURL, tag string) []Link {
+	matches := textURLRegex.FindAllString(text, -1)
+	links := make([]Link, 0, len(matches))
+	for _, match := range matches {
+		href := trimURLTrailing(match)
+		if href == "" {
+			continue
+		}
+		// "www.example.com" in prose means http://www.example.com; without the
+		// scheme it would resolve against the source page as a relative path.
+		if strings.HasPrefix(strings.ToLower(href), "www.") {
+			href = "http://" + href
+		}
+		if !hasValidURLChars(href) {
+			continue
+		}
+		hasParams := false
+		if idx := strings.IndexByte(href, '?'); idx >= 0 && idx < len(href)-1 {
+			hasParams = true
+		}
+		links = append(links, Link{
+			HREF:      href,
+			Category:  categorize(href),
+			LinkType:  determineLinkType(href),
+			Class:     ClassifyURL(href),
+			HasParams: hasParams,
+			SourceURL: sourceURL,
+			Tag:       tag,
+		})
+	}
+	return deduplicate(links)
+}
+
+// trimURLTrailing removes the punctuation that a sentence puts after a URL
+// without being part of it. A closing bracket is only dropped when it has no
+// matching opener inside the URL, so a path such as .../Foo_(bar) survives.
+func trimURLTrailing(s string) string {
+	s = strings.TrimRight(s, ".,;:!?\"'")
+	for len(s) > 0 {
+		switch last := s[len(s)-1]; last {
+		case ')':
+			if strings.Count(s, ")") > strings.Count(s, "(") {
+				s = s[:len(s)-1]
+				continue
+			}
+		case ']':
+			if strings.Count(s, "]") > strings.Count(s, "[") {
+				s = s[:len(s)-1]
+				continue
+			}
+		case '}':
+			if strings.Count(s, "}") > strings.Count(s, "{") {
+				s = s[:len(s)-1]
+				continue
+			}
+		}
+		break
+	}
+	// An opening bracket with no partner means the URL ran into a parenthetical
+	// aside; e.g. "see http://x.com(also)": keep only up to the bracket.
+	if open := lastUnmatchedOpen(s); open >= 0 {
+		s = s[:open]
+	}
+	return s
+}
+
+// lastUnmatchedOpen returns the index of the rightmost '(' that has no closing
+// ')', or -1 when the brackets balance.
+func lastUnmatchedOpen(s string) int {
+	depth := 0
+	for i := len(s) - 1; i >= 0; i-- {
+		switch s[i] {
+		case ')':
+			depth++
+		case '(':
+			if depth == 0 {
+				return i
+			}
+			depth--
+		}
+	}
+	return -1
+}
+
 // MatchesAPIPattern reports whether the URL path contains any configured API
 // pattern (e.g. "/api/", "ajax.php", "/rest/", "/bitrix/services/").
 func MatchesAPIPattern(href string) bool {

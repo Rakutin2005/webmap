@@ -24,6 +24,7 @@ type Config struct {
 	AllDomains      bool
 	ShowTags        bool
 	AnalyzeJS       bool
+	ParseText       bool
 	Emulate         bool
 	Graphical       bool
 	Markdown        bool
@@ -103,6 +104,7 @@ func Register(fs *flag.FlagSet) *Config {
 	fs.BoolVar(&c.AllDomains, "a", false, "Parse all domains (no restrictions on target URIs)")
 	fs.BoolVar(&c.ShowTags, "t", false, "Show link tags (absolute/relative/web)")
 	fs.BoolVar(&c.AnalyzeJS, "j", false, "Analyze JS files for API endpoints")
+	fs.BoolVar(&c.ParseText, "parse-text", false, "Parse text documents for links (txt, csv, log, md, json, xml, pdf, doc/docx, rtf, odt, xlsx, pptx, ...)")
 	fs.BoolVar(&c.Emulate, "emulate", false, "Emulate browser: execute all JS in sandboxed goja engine, track network calls")
 	fs.IntVar(&c.EmulateTimeout, "emu-timeout", 5000, "Emulation: max ms of JS execution per page (0 = unlimited)")
 	fs.IntVar(&c.EmulateWorkers, "emu-workers", 0, "Emulation: max concurrent page emulations (0 = auto: min(4, CPUs))")

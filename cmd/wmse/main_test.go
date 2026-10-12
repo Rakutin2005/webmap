@@ -29,8 +29,8 @@ var scanFlags = []string{
 	"-cache", "-cdn", "-cf", "-color", "-cookie", "-emu-maxjobs", "-emu-maxjs",
 	"-emu-maxleaks", "-emu-timeout", "-emu-workers", "-emulate", "-f", "-follow",
 	"-full", "-group-count", "-headers-all-hosts", "-j", "-k", "-nogroup",
-	"-noise", "-o", "-o-raw", "-patterns", "-r", "-rdepth", "-react", "-refs",
-	"-rlimit", "-str", "-t", "-url", "-waf", "-wp",
+	"-noise", "-o", "-o-raw", "-parse-text", "-patterns", "-r", "-rdepth", "-react",
+	"-refs", "-rlimit", "-str", "-t", "-url", "-waf", "-wp",
 }
 
 // capture runs fn with stdout redirected and returns what it printed. The views
